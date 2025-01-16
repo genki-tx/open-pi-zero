@@ -17,3 +17,4 @@ uv pip install -e . ../SimplerEnv/ManiSkill2_real2sim
 
 # Adding the following line to your ~/.bashrc to activate the virtual environment automatically
 #echo "source ${PRJ_DIR}/.venv/bin/activate" >> ~/.bashrc
+

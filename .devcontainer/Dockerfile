@@ -8,10 +8,14 @@ RUN apt-get update && \
         git \
         ca-certificates \
         curl \
+        libglib2.0-0 \
         libvulkan1 \
         vulkan-tools \
-        libgl1 \
-        libglib2.0-0 \
+        libglvnd0 \
+        libglu-dev \
+        libegl1 \
+        libxext6 \
+        libx11-6 \
         && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
@@ -21,6 +25,10 @@ RUN sh /uv-installer.sh && rm /uv-installer.sh
 ENV PATH="/root/.local/bin/:$PATH"
 RUN uv python install 3.10.13
 
+# to use SimplerEnv (depends on Vulkan, with NVIDIA GPU)
+COPY nvidia_icd.json /usr/share/vulkan/icd.d/
+
+# The following will be installed inside container by script/init_env.sh
 #RUN mkdir /root/workspace
 #WORKDIR /root/workspace
 #RUN git clone https://github.com/allenzren/SimplerEnv --recurse-submodules && \
@@ -31,5 +39,4 @@ RUN uv python install 3.10.13
 #    uv pip install -e . ../SimplerEnv/ManiSkill2_real2sim
 
 WORKDIR /root/workspace/open-pi-zero
-
-CMD ["/bin/bash"]`
+CMD ["/bin/bash"]
