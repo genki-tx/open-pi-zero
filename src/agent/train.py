@@ -5,40 +5,37 @@ Main training agent. Using torch.compile and bfloat16 by default. Optionally (Q)
 
 import logging
 import os
-import random
 from collections import deque
 
 import bitsandbytes as bnb
 import einops
 import numpy as np
 import torch
+import wandb
 from omegaconf import OmegaConf
 from PIL import Image
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
-import wandb
 from src.agent.dataset import TorchRLDSInterleavedDataset
 from src.model.vla.pizero import PiZero
 from src.model.vla.processing import VLAProcessor
+from src.utils.decorator import main_rank_only
 from src.utils.metric import get_action_accuracy
-from src.utils.monitor import Timer, log_allocated_gpu_memory, log_execution_time
+from src.utils.monitor import (
+    MainRankFilter,
+    Timer,
+    log_allocated_gpu_memory,
+    log_execution_time,
+)
 from src.utils.optim import CosineAnnealingWarmupRestarts, get_num_params_in_billions
 
 log = logging.getLogger(__name__)
 
-os.environ["WANDB__SERVICE_WAIT"] = "300"
-
 
 class TrainAgent:
     def __init__(self, cfg):
-        # seeding
-        self.seed = cfg.get("seed", 42)
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-
-        # devices
+        # device setup
         self.gpu_id = cfg.gpu_id
         self.device = torch.device(f"cuda:{self.gpu_id}")
         self.multi_gpu = cfg.multi_gpu
@@ -57,10 +54,11 @@ class TrainAgent:
                     f"Local rank: {local_rank}, GPU UUID: {torch.cuda.get_device_properties(i).uuid}"
                 )
         self.main_rank = not self.multi_gpu or global_rank == 0
+        log.addFilter(MainRankFilter(main_rank=self.main_rank))
 
         # logging
-        self.use_wandb = cfg.get("wandb", False)
-        if self.use_wandb and self.main_rank:
+        self.use_wandb = cfg.get("wandb", False) and self.main_rank
+        if self.use_wandb:
             wandb.init(
                 entity=cfg.wandb.entity,
                 project=cfg.wandb.project,
@@ -71,6 +69,7 @@ class TrainAgent:
             )
         self.debug = cfg.get("debug", False)
         self.save_model_freq = int(cfg.save_model_freq)
+        self.save_model_start = int(cfg.get("save_model_start", 0))
         self.log_freq = cfg.log_freq
         self.log_dir = cfg.log_dir
         self.checkpoint_dir = os.path.join(self.log_dir, "checkpoint")
@@ -80,6 +79,8 @@ class TrainAgent:
         self.n_updates = int(cfg.n_updates)
         self.max_grad_norm = cfg.max_grad_norm
         self.use_amp = cfg.get("use_amp", True)
+        self.dtype = torch.bfloat16 if cfg.get("use_bf16", True) else torch.float32
+        self.use_torch_compile = cfg.get("use_torch_compile", True)
 
         # model
         assert not (
@@ -89,7 +90,6 @@ class TrainAgent:
             log.warning(
                 "Quantizing VLM but not adding Lora weights, which means the VLM will be fully frozen!"
             )  # since the weights have requires_grad=False. However, we are not excluding the weights from the optimizer yet!
-        self.dtype = torch.bfloat16 if cfg.get("use_bf16", True) else torch.float32
         self.model = PiZero(cfg, use_ddp=self.multi_gpu)
         if cfg.resume_checkpoint_path:
             self.load_checkpoint(cfg.resume_checkpoint_path)
@@ -101,9 +101,7 @@ class TrainAgent:
             self.model.freeze_non_lora_weights_in_vlm()
         self.model.to(self.dtype)
         self.model.to(self.device)
-        if cfg.get(
-            "use_torch_compile", True
-        ):  # model being compiled in the first batch which takes some time
+        if self.use_torch_compile:
             self.model = torch.compile(
                 self.model,
                 mode="default",  # "reduce-overhead" speeds up a lot and reduces VRAM usage a lot more, but causes nan loss on L40, maybe issue with cudagraphs or 8-bit optimizer; max-autotune works on H100s, takes a while to compile
@@ -212,6 +210,22 @@ class TrainAgent:
         if cfg.resume_checkpoint_path:
             self.load_optimizer(cfg.resume_checkpoint_path)
 
+        # Set up model averaging
+        self.use_ema = cfg.get("use_ema", False)
+        if self.use_ema:
+            self.ema_start = cfg.ema_start
+            self.ema_decay = cfg.get("ema_decay", 0.99)
+            self.ema_freq = cfg.get("ema_freq", 1)
+            self.ema_device = cfg.get("ema_device", self.device)
+        self.use_swa = cfg.get("use_swa", False)
+        if self.use_swa:
+            self.swa_start = cfg.swa_start
+            self.swa_freq = cfg.swa_freq
+            self.swa_device = cfg.get("swa_device", "cpu")
+        assert not (
+            self.use_ema and self.use_swa
+        ), "Cannot use both EMA and SWA at once"
+
         ########### Input processing ###########
 
         # flow matching timestep sampling
@@ -253,15 +267,19 @@ class TrainAgent:
         cnt_update = (
             0 if not hasattr(self, "cnt_update") else self.cnt_update
         )  # resume training if loaded checkpoint
-        loss_train_deque = deque(maxlen=self.grad_accumulation_steps)
+        loss_deque = deque(maxlen=self.grad_accumulation_steps)
         new_eval_from_last_log = False
+
+        # deal with the various model.module
+        model_meta = self.model
         if self.multi_gpu:
             import torch.distributed as dist
 
             model = self.model.module
         else:
             model = self.model
-        self.model.train()
+        model_eval = model
+        model_meta.train()
 
         def preprocess_batch(batch, split_mask: bool, sample_fm_time: bool):
             # TODO(allenzren): support multi-image / proprio history
@@ -343,23 +361,23 @@ class TrainAgent:
 
                 # make sure only syncing when taking gradient steps
                 if (cnt_batch + 1) % self.grad_accumulation_steps != 0:
-                    with self.model.no_sync():
+                    with model_meta.no_sync():
                         with torch.autocast(
                             device_type="cuda", dtype=self.dtype, enabled=self.use_amp
                         ):
-                            loss_train = self.model(**inputs)
+                            loss = model_meta(**inputs)
                         if self.debug:
                             log_allocated_gpu_memory(log, f"forward batch {cnt_batch}")
-                        normalized_loss = loss_train / self.grad_accumulation_steps
+                        normalized_loss = loss / self.grad_accumulation_steps
                         normalized_loss.backward()
                 else:
                     with torch.autocast(
                         device_type="cuda", dtype=self.dtype, enabled=self.use_amp
                     ):
-                        loss_train = self.model(**inputs)
+                        loss = model_meta(**inputs)
                     if self.debug:
                         log_allocated_gpu_memory(log, f"forward batch {cnt_batch}")
-                    normalized_loss = loss_train / self.grad_accumulation_steps
+                    normalized_loss = loss / self.grad_accumulation_steps
                     normalized_loss.backward()  # gradients synced
 
                     # step
@@ -381,77 +399,107 @@ class TrainAgent:
                         self.vlm_optimizer.zero_grad(set_to_none=True)
                     cnt_update += 1
 
+                    # update ema after every grad step
+                    if hasattr(self, "model_avg"):
+                        if self.use_ema and cnt_update % self.ema_freq == 0:
+                            self.model_avg.update_parameters(model)
+                        if self.use_swa and cnt_update % self.swa_freq == 0:
+                            self.model_avg.update_parameters(model)
+                            log.info("SWA updated")
+
                     # save model at the end of update, models just synced
-                    if self.main_rank and (
+                    if (
                         cnt_update % self.save_model_freq == 0
-                        or cnt_update == self.n_updates
-                    ):
-                        self.save_training(cnt_update, cnt_batch)
+                        and cnt_update > self.save_model_start
+                    ) or cnt_update == self.n_updates:
+                        self.save_training(cnt_update, cnt_batch, self.main_rank)
 
                 # aggregate loss
                 if self.multi_gpu:
-                    dist.all_reduce(loss_train, op=dist.ReduceOp.SUM)
-                    loss_train_deque.append(loss_train.item() / dist.get_world_size())
+                    dist.all_reduce(loss, op=dist.ReduceOp.SUM)
+                    loss_deque.append(loss.item() / dist.get_world_size())
                 else:
-                    loss_train_deque.append(loss_train.item())
+                    loss_deque.append(loss.item())
 
                 # validation with action accuracy
                 if self.run_eval and (cnt_batch + 1) % self.eval_freq == 0:
+                    log.info(
+                        f"Running evaluation for {self.per_device_num_eval_batch} batches..."
+                    )
                     new_eval_from_last_log = True
-                    self.model.eval()
+                    model_meta.eval()
                     eval_accuracy = torch.zeros(
                         len(self.eval_thresholds), device=self.device
                     )
                     eval_l1_loss = torch.tensor(0.0, device=self.device)
-                    if self.main_rank:
-                        log.info(
-                            f"Running evaluation for {self.per_device_num_eval_batch} batches..."
-                        )
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         for _ in range(self.per_device_num_eval_batch):
                             batch_eval = next(self.val_dataiterator)
                             inputs = preprocess_batch(
-                                batch_eval, split_mask=True, sample_fm_time=False
+                                batch_eval,
+                                split_mask=True,
+                                sample_fm_time=False,
                             )
                             gt_actions = inputs.pop("actions")
-                            preds = model.infer_action(**inputs)
+                            preds = model_eval.infer_action(**inputs)
                             eval_accuracy += get_action_accuracy(
                                 gt_actions, preds, self.eval_thresholds
                             )
                             eval_l1_loss += torch.nn.functional.l1_loss(
                                 preds, gt_actions
                             )
+                    model_meta.train()
+
+                    # get stats
                     eval_accuracy = eval_accuracy / self.per_device_num_eval_batch
                     eval_l1_loss = eval_l1_loss / self.per_device_num_eval_batch
-                    self.model.train()
                     if self.multi_gpu:
                         dist.all_reduce(eval_accuracy, op=dist.ReduceOp.SUM)
                         dist.all_reduce(eval_l1_loss, op=dist.ReduceOp.SUM)
                         eval_accuracy /= dist.get_world_size()
                         eval_l1_loss /= dist.get_world_size()
-                    if self.main_rank:
-                        log_msg = f"Eval | l1 Loss: {eval_l1_loss.item():.3f} | "
-                        log_msg += " | ".join(
-                            [
-                                f"acc thres {threshold}: {accuracy.item():.3f}"
-                                for threshold, accuracy in zip(
-                                    self.eval_thresholds, eval_accuracy
-                                )
-                            ]
+                    log_msg = f"Eval | l1 Loss: {eval_l1_loss.item():.3f} | "
+                    log_msg += " | ".join(
+                        [
+                            f"acc thres {threshold}: {accuracy.item():.3f}"
+                            for threshold, accuracy in zip(
+                                self.eval_thresholds, eval_accuracy
+                            )
+                        ]
+                    )
+                    log.info(log_msg)
+
+                # start SWA/ema --- wrap the actual model, not the DDP model
+                if not hasattr(self, "model_avg"):
+                    if self.use_swa and cnt_update == self.swa_start:
+                        self.model_avg = torch.optim.swa_utils.AveragedModel(
+                            model, device=self.swa_device
                         )
-                        log.info(log_msg)
+                        log.info("Starting SWA...")
+                    if self.use_ema and cnt_update == self.ema_start:
+                        self.model_avg = torch.optim.swa_utils.AveragedModel(
+                            model,
+                            multi_avg_fn=torch.optim.swa_utils.get_ema_multi_avg_fn(
+                                self.ema_decay
+                            ),
+                            device=self.ema_device,
+                        )
+                        model_eval = (
+                            self.model_avg.module
+                        )  # switch to using ema for eval
+                        log.info(f"Starting EMA with decay {self.ema_decay}...")
 
                 # log loss
-                if self.main_rank and cnt_batch % self.log_freq == 0:
-                    loss_train_metric = np.mean(loss_train_deque)
+                if cnt_batch % self.log_freq == 0:
+                    loss_metric = np.mean(loss_deque)
                     peak_vram = torch.cuda.max_memory_reserved(self.gpu_id) / (1024**3)
-                    log_msg = f"Batch {cnt_batch} Update {cnt_update}: t {timer():8.4f} | vram {peak_vram:6.3f} | train loss {loss_train_metric:6.4f} | action lr {self.action_optimizer.param_groups[0]['lr']:10.8f}"
+                    log_msg = f"Batch {cnt_batch} Update {cnt_update}: t {timer():8.4f} | vram {peak_vram:6.3f} | loss {loss_metric:6.4f} | action lr {self.action_optimizer.param_groups[0]['lr']:10.8f}"
                     if self.train_vlm:
                         log_msg += f" | vlm lr {self.vlm_optimizer.param_groups[0]['lr']:10.8f}"
                     log.info(log_msg)
                     if self.use_wandb:
                         wandb_metrics = {
-                            "loss - train": loss_train_metric,
+                            "loss - train": loss_metric,
                             "gradient steps": cnt_update,
                             "action lr": self.action_optimizer.param_groups[0]["lr"],
                         }
@@ -477,17 +525,24 @@ class TrainAgent:
                 if cnt_update >= self.n_updates:
                     return
 
-    @log_execution_time()
-    def save_training(self, cnt_update, cnt_batch):
-        # TODO(allenzren): skip saving redundant proprio weights
+    @main_rank_only
+    @log_execution_time(log)
+    def save_training(self, cnt_update: int, cnt_batch: int, main_rank: bool):
+        if hasattr(self, "model_avg"):
+            weights = self.model_avg.module.state_dict()
+            model_type = "ema" if self.use_ema else "swa"
+            n_averaged = self.model_avg.state_dict()["n_averaged"]
+        else:
+            if self.multi_gpu:
+                weights = self.model.module.state_dict()
+            else:
+                weights = self.model.state_dict()
+            model_type = "normal"
+            n_averaged = 1
         data = {
             "cnt_update": cnt_update,
             "cnt_batch": cnt_batch,
-            "model": (
-                self.model.module.state_dict()
-                if self.multi_gpu
-                else self.model.state_dict()
-            ),
+            "model": weights,
             "action_optimizer": self.action_optimizer.state_dict(),
             "vlm_optimizer": self.vlm_optimizer.state_dict()
             if self.train_vlm
@@ -497,30 +552,32 @@ class TrainAgent:
             if self.train_vlm
             else None,
             "wandb_id": wandb.run.id if self.use_wandb else None,
+            "n_averaged": n_averaged,
         }
         savepath = os.path.join(self.checkpoint_dir, f"step{cnt_update}.pt")
         torch.save(data, savepath)
         checkpoint_size_in_gb = os.path.getsize(savepath) / (1024**3)
-        log.info(f"Saved model to {savepath}, size: {checkpoint_size_in_gb:.3f} GB")
+        log.info(
+            f"Saved model to {savepath}, size: {checkpoint_size_in_gb:.2f} GB, type: {model_type}, averaged: {n_averaged}"
+        )
 
-    @log_execution_time()
-    def load_checkpoint(self, path):
+    @log_execution_time(log)
+    def load_checkpoint(self, path: str):
         """load to cpu first, then move to gpu"""
         data = torch.load(path, weights_only=True, map_location="cpu")
         self.cnt_update = data["cnt_update"]
         self.cnt_batch = data["cnt_batch"]
         self.wandb_id = data["wandb_id"]
-        # remove "_orig_mod." prefix if saved model was compiled
         data["model"] = {
             k.replace("_orig_mod.", ""): v for k, v in data["model"].items()
-        }
+        }  # remove "_orig_mod." prefix if saved model was compiled
         self.model.load_state_dict(data["model"], strict=True)
         log.info(
             f"Loaded model from {path} at update {self.cnt_update} batch {self.cnt_batch}"
         )
 
-    @log_execution_time()
-    def load_optimizer(self, path):
+    @log_execution_time(log)
+    def load_optimizer(self, path: str):
         """load to cpu first, then move to gpu"""
         from src.utils.optim import optimizer_to
 

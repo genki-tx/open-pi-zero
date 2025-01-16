@@ -29,12 +29,13 @@ class GemmaRotaryEmbedding(nn.Module):
     https://github.com/huggingface/transformers/pull/29285
     """
 
-    def __init__(self, dim, max_position_embeddings=2048, base=10000):
+    def __init__(self, dim, base=10000):
         super().__init__()
 
         self.dim = dim  # it is set to the head_dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
+        self.base = (
+            base  # should be tuned based on the max_seq_len, e.g., in action expert
+        )
 
         # Calculate the theta according to the formula theta_i = base^(2i/dim) where i = 0, 1, 2, ..., dim // 2
         inv_freq = 1.0 / (
@@ -44,7 +45,7 @@ class GemmaRotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", tensor=inv_freq, persistent=False)
 
     @torch.no_grad()
-    def forward(self, x, position_ids, seq_len=None):
+    def forward(self, x, position_ids):
         # x: [bs, num_attention_heads, seq_len, head_size]
         # Copy the inv_freq tensor for batch in the sequence
         # inv_freq_expanded: [Batch_Size, Head_Dim // 2, 1]

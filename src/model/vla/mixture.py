@@ -1,7 +1,7 @@
 """
 Individual mixture in PaliGemma format
 
-Additional support for AdaLN(-Zero) and (Q)LoRA
+Additional support for adaLN(-Zero) and (Q)LoRA
 
 """
 
@@ -181,7 +181,6 @@ class MixtureAttention(nn.Module):
         )
         self.rotary_emb = GemmaRotaryEmbedding(
             self.head_dim,
-            max_position_embeddings=config.max_position_embeddings,
             base=config.rope_theta,
         )
 
@@ -222,7 +221,7 @@ class MixtureAttention(nn.Module):
         self, x: torch.FloatTensor, position_ids: torch.LongTensor
     ) -> torch.FloatTensor:
         # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
-        cos, sin = self.rotary_emb(x, position_ids, seq_len=None)
+        cos, sin = self.rotary_emb(x, position_ids)
         return cos, sin
 
     def forward_apply_rotary_emb(
