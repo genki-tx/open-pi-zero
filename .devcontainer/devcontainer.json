@@ -1,0 +1,38 @@
+{
+    "name": "open-pi-zero",
+    "build": {
+      "dockerfile": "../Dockerfile"
+    },
+    "runArgs": [
+      "--privileged",
+      "--gpus=all",
+      "--net=host",
+      "--env=VLA_DATA_DIR=/root/dataset/vla_data",
+      "--env=VLA_LOG_DIR=/root/dataset/vla_log",
+      "--env=TRANSFORMERS_CACHE=/root/dataset/hf_models",
+      "--env=VLA_WANDB_ENTITY=${localEnv:WANDB_ENTITY}",
+      "--env=WANDB_API_KEY=${localEnv:WANDB_API_KEY}",
+      "--env=MS2_REAL2SIM_ASSET_DIR=/root/workspace/SimplerEnv/ManiSkill2_real2sim/data"
+    ],
+    "mounts": [
+      "source=${localEnv:HOME}/dataset,target=/root/workspace/dataset,type=bind",
+      "source=${localWorkspaceFolder},target=/root/workspace/open-pi-zero,type=bind"
+    ],
+    "workspaceFolder": "/root/workspace/open-pi-zero",
+    "customizations": {
+      "vscode": {
+        "extensions": [
+          "ms-python.python",
+          "ms-python.vscode-pylance",
+          "donjayamanne.githistory",
+          "ms-azuretools.vscode-docker"
+        ]
+      }
+    },
+    "postCreateCommand": "/root/workspace/open-pi-zero/scripts/init_env.sh",
+    "remoteEnv": {
+      "WANDB_ENTITY": "${localEnv:WANDB_ENTITY}",
+      "WANDB_API_KEY": "${localEnv:WANDB_API_KEY}"
+    }
+  }
+  
