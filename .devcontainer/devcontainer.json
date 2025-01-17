@@ -26,8 +26,6 @@
       "vscode": {
         "extensions": [
           "ms-python.python",
-          "ms-python.vscode-pylance",
-          "donjayamanne.githistory",
           "ms-azuretools.vscode-docker"
         ]
       }
