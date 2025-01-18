@@ -1,7 +1,8 @@
 {
     "name": "open-pi-zero",
     "build": {
-      "dockerfile": "Dockerfile"
+      "context": "..",
+      "dockerfile": "../Dockerfile"
     },
     "runArgs": [
       "--privileged",
@@ -27,13 +28,12 @@
         "extensions": [
           "ms-python.python",
           "ms-azuretools.vscode-docker"
-        ]
+        ],
+        "settings": {
+          "python.defaultInterpreterPath": "/root/workspace/.venv/bin/python",
+          "python.terminal.activateEnvironment": true
+        }
       }
     },
-    "postCreateCommand": "/bin/bash /root/workspace/open-pi-zero/scripts/init_env.sh",
-    "remoteEnv": {
-      "WANDB_ENTITY": "${localEnv:WANDB_ENTITY}",
-      "WANDB_API_KEY": "${localEnv:WANDB_API_KEY}"
-    }
-  }
-  
+    "postCreateCommand": ""
+}

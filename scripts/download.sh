@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e
+
 # modify the path to download the pretrain model to match the path in your environment
 DATASET_DIR="${HOME}/dataset"
 
@@ -15,10 +15,10 @@ mkdir -p ${VLA_LOG_DIR}
 download_datasets=true
 if [ "$download_datasets" = true ]; then
     # download paligemma from hugging face, setup your account with huggingface-cli first, https://huggingface.co/docs/huggingface_hub/en/guides/cli
-    #huggingface-cli download google/paligemma-3b-pt-224 --local-dir ${HF_DATA_DIR}/paligemma-3b-pt-224
+    huggingface-cli download google/paligemma-3b-pt-224 --local-dir ${HF_DATA_DIR}/paligemma-3b-pt-224
 
     # download fractal, setup gsutil command, https://cloud.google.com/storage/docs/gsutil_install
-    #gsutil -m cp -n -r gs://gresearch/robotics/fractal20220817_data/0.1.0 ${VLA_DATA_DIR}/fractal20220817_data
+    gsutil -m cp -n -r gs://gresearch/robotics/fractal20220817_data/0.1.0 ${VLA_DATA_DIR}/fractal20220817_data
 
     # download bridge dataset
     wget -r -np -nH --cut-dirs=4 -R "index.html*" -nc -P ${VLA_DATA_DIR}/ https://rail.eecs.berkeley.edu/datasets/bridge_release/data/tfds/bridge_dataset/1.0.0
