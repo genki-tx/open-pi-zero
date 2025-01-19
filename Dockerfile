@@ -37,6 +37,6 @@ RUN uv sync && \
     uv pip install -e . ./SimplerEnv/ManiSkill2_real2sim --no-config && \
     rm pyproject.toml
 
-RUN echo "[ -z "$VIRTUAL_ENV" ] && source /root/workspace/.venv/bin/activate" >> /root/.bashrc
+RUN echo '[ -z "$VIRTUAL_ENV" ] && source /root/workspace/.venv/bin/activate' >> /root/.bashrc
 WORKDIR /root/workspace/open-pi-zero
 CMD ["/bin/bash"]

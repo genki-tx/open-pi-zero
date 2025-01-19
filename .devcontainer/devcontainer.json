@@ -8,6 +8,7 @@
       "--privileged",
       "--gpus=all",
       "--net=host",
+      "--env=DISPLAY=unix${localEnv:DISPLAY}",
       "--env=VLA_DATA_DIR=/root/workspace/dataset/vla_data",
       "--env=VLA_LOG_DIR=/root/workspace/dataset/vla_log",
       "--env=TRANSFORMERS_CACHE=/root/workspace/dataset/hf_models",
@@ -20,7 +21,8 @@
     ],
     "mounts": [
       "source=${localEnv:HOME}/dataset,target=/root/workspace/dataset,type=bind",
-      "source=${localWorkspaceFolder},target=/root/workspace/open-pi-zero,type=bind"
+      "source=${localWorkspaceFolder},target=/root/workspace/open-pi-zero,type=bind",
+      "source=/tmp/.X11-unix,target=/tmp/.X11-unix,type=bind"
     ],
     "workspaceFolder": "/root/workspace/open-pi-zero",
     "customizations": {

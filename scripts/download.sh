@@ -18,6 +18,7 @@ if [ "$download_datasets" = true ]; then
     huggingface-cli download google/paligemma-3b-pt-224 --local-dir ${HF_DATA_DIR}/paligemma-3b-pt-224
 
     # download fractal, setup gsutil command, https://cloud.google.com/storage/docs/gsutil_install
+    mkdir -p ${VLA_DATA_DIR}/fractal20220817_data
     gsutil -m cp -n -r gs://gresearch/robotics/fractal20220817_data/0.1.0 ${VLA_DATA_DIR}/fractal20220817_data
 
     # download bridge dataset
