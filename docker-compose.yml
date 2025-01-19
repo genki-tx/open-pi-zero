@@ -1,0 +1,26 @@
+services:
+  open-pi-zero:
+    container_name: pi-zero
+    build:
+      context: .
+      dockerfile: Dockerfile
+    runtime: nvidia
+    privileged: true
+    network_mode: "host"
+    environment:
+      VLA_DATA_DIR: "/root/workspace/dataset/vla_data"
+      VLA_LOG_DIR: "/root/workspace/dataset/vla_log"
+      TRANSFORMERS_CACHE: "/root/workspace/dataset/hf_models"
+      VLA_WANDB_ENTITY: "${WANDB_ENTITY}"
+      WANDB_API_KEY: "${WANDB_API_KEY}"
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      MS2_REAL2SIM_ASSET_DIR: "/root/workspace/SimplerEnv/ManiSkill2_real2sim/data"
+      VK_ICD_FILENAMES: "/usr/share/vulkan/icd.d/nvidia_icd.json"
+    volumes:
+      - "/mnt/dataset:/root/workspace/dataset:rw"
+      - "./:/root/workspace/open-pi-zero:rw"
+    working_dir: "/root/workspace/open-pi-zero"
+    tty: true
+    stdin_open: true
+
