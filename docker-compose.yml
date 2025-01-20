@@ -21,6 +21,7 @@ services:
       - "/mnt/dataset:/root/workspace/dataset:rw"
       - "./:/root/workspace/open-pi-zero:rw"
     working_dir: "/root/workspace/open-pi-zero"
+    shm_size: '32g'
     tty: true
     stdin_open: true
 
