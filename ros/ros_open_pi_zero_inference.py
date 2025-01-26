@@ -134,9 +134,6 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.model_input_height = self.cfg.env.adapter.image_size[1]
         loginfo(f"Image Size w:{self.model_input_width}, h:{self.model_input_height}")
 
-        # We store the latest image and latest joint states
-        self._clear_states()
-
         # We track inference times in a sliding window to log stats
         self.inference_time_buffer = deque(maxlen=20)
         self.timer_count = 0
@@ -159,6 +156,11 @@ class GoogleRobotOpenPiZeroInferenceNode:
         rospy.wait_for_service("/moveit_server/plan_arm")
         self.moveit_plan_arm = rospy.ServiceProxy("/moveit_server/plan_arm", Trigger)
         loginfo("Connected to /moveit_server/plan_arm service")
+
+        self._move_initial_pose()
+
+        # We store the latest image and latest joint states
+        self._clear_states()
 
         # Start a periodic timer to run inference + publish commands
         rospy.Timer(rospy.Duration(1.0 / self.loop_rate_hz), self._control_loop)
@@ -480,6 +482,10 @@ class GoogleRobotOpenPiZeroInferenceNode:
         goal = FollowJointTrajectoryGoal()
         goal.trajectory = traj
         self.client.send_goal(goal)
+
+    def _move_initial_pose(self):
+        initial_pose = [0.0, 0.1432, 0.1476, 1.22, 0.0, 0.93, -1.394, 0.4, 0.4, 0.0, 0.8]
+        self._send_joint_trajectory(initial_pose)
 
     def spin(self):
         rospy.spin()
