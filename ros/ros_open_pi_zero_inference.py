@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-
+import json
 import rospy
 import random
 import actionlib
@@ -15,6 +15,7 @@ from sensor_msgs.msg import Image
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from geometry_msgs.msg import Pose
+from std_srvs.srv import Trigger
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
 import tf
 import tf.transformations as tr
@@ -54,6 +55,10 @@ def loginfo(msg):
 def logwarn(msg):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}][WARN] {msg}")    
+
+def logerr(msg):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}][ERROR] {msg}")  
 
 ###############################
 # Utility for loading checkpoint
@@ -130,8 +135,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         loginfo(f"Image Size w:{self.model_input_width}, h:{self.model_input_height}")
 
         # We store the latest image and latest joint states
-        self.latest_image = None
-        self.latest_joints = None
+        self._clear_states()
 
         # We track inference times in a sliding window to log stats
         self.inference_time_buffer = deque(maxlen=20)
@@ -149,6 +153,13 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.client.wait_for_server()
         loginfo("Connected to google_fullbody_controller action server.")
 
+        # Setup motion planner communication
+        self.moveit_pose_pub = rospy.Publisher("/moveit_server/target_pose", Pose, queue_size=1, latch=True)
+        loginfo("Waiting for /moveit_server/plan_arm service ...")
+        rospy.wait_for_service("/moveit_server/plan_arm")
+        self.moveit_plan_arm = rospy.ServiceProxy("/moveit_server/plan_arm", Trigger)
+        loginfo("Connected to /moveit_server/plan_arm service")
+
         # Start a periodic timer to run inference + publish commands
         rospy.Timer(rospy.Duration(1.0 / self.loop_rate_hz), self._control_loop)
 
@@ -158,6 +169,9 @@ class GoogleRobotOpenPiZeroInferenceNode:
         Here, we'll keep it in HWC format so we can easily resize or process with OpenCV.
         """
         try:
+            if self.latest_image is not None:
+                return
+
             height, width = msg.height, msg.width
             channels = 3  # RGB8
             if msg.encoding == 'rgb8':
@@ -173,6 +187,9 @@ class GoogleRobotOpenPiZeroInferenceNode:
         """
         Extract relevant joint positions from /joint_states and build a dict
         """
+        if self.latest_joints is not None:
+            return
+
         name_to_pos = {}
         for i, nm in enumerate(msg.name):
             pos = msg.position[i]
@@ -248,6 +265,11 @@ class GoogleRobotOpenPiZeroInferenceNode:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         return inputs
 
+    def _clear_states(self):
+        self.latest_image = None
+        self.latest_joints = None
+        self.inference_busy = False
+
     def _control_loop(self, _event):
         """
         Called periodically at ~loop_rate_hz to:
@@ -258,12 +280,17 @@ class GoogleRobotOpenPiZeroInferenceNode:
           - Solve IK (or use a PD EEF controller) to get joint angles
           - Send the resulting joint command to the trajectory controller
         """
-        self.timer_count += 1
 
         # Check we have the latest camera image, finger joint states
         if self.latest_image is None or self.latest_joints is None:
             return
 
+        # Mutex to prevent running inference multiple times
+        if self.inference_busy:
+            return
+        self.inference_busy = True
+
+        self.timer_count += 1
         start_t = time.time()
 
         # Gather EEF pose from TF
@@ -278,7 +305,8 @@ class GoogleRobotOpenPiZeroInferenceNode:
             eef_pos = np.array(trans, dtype=np.float32)
             eef_quat_xyzw  = np.array(rot, dtype=np.float32)
         except Exception as e:
-            rospy.logwarn(f"Could not lookup TF for link_gripper_tcp: {e}")
+            logwarn(f"Could not lookup TF for link_gripper_tcp: {e}")
+            self._clear_states()
             return
 
         # Compute 'gripper_opening' from finger joints
@@ -303,7 +331,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.inference_time_buffer.append(infer_dt)
         if self.timer_count % 10 == 0:
             t_arr = np.array(self.inference_time_buffer, dtype=np.float32)
-            rospy.loginfo(
+            loginfo(
                 f"[PiZero Inference] avg={t_arr.mean():.3f}s, min={t_arr.min():.3f}s, max={t_arr.max():.3f}s, n={len(t_arr)}"
             )
         predicted_actions = predicted_actions[0].to(torch.float32).cpu().numpy() # shape (T,7), convert BF16 to FP32
@@ -350,6 +378,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
             new_joint_positions = self._moveit_ik_solver(new_pos, new_quat_xyzw, new_gripper_val)
             if new_joint_positions is None:
                 logwarn("MoveIt IK solver failed. Skipping command.")
+                self._clear_states()
                 return
             break # for now, just run 1 step
 
@@ -357,13 +386,39 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self._send_joint_trajectory(new_joint_positions)
 
         # Clear buffers so next loop waits for new sensor data
-        self.latest_image = None
-        self.latest_joints = None
+        self._clear_states()
 
-    def moveit_server_plan(self, pose_goal):
-        joint_names =  ['joint_torso', 'joint_shoulder', 'joint_bicep', 'joint_elbow', 'joint_forearm', 'joint_wrist', 'joint_gripper']
-        positions = [0.0, 0.435, 0.0, 2.33, 0.0, -1.21, 0.0]
-        return (joint_names, positions)
+    def moveit_server_plan_arm(self, pose_goal):
+        # stub
+        #joint_names =  ['joint_torso', 'joint_shoulder', 'joint_bicep', 'joint_elbow', 'joint_forearm', 'joint_wrist', 'joint_gripper']
+        #positions = [0.0, 0.435, 0.0, 2.33, 0.0, -1.21, 0.0]
+        #return (joint_names, positions)
+        self.moveit_pose_pub.publish(pose_goal)
+
+        try:
+            response = self.moveit_plan_arm()
+        except rospy.ServiceException as e:
+            logerr(f"Service call failed: {e}")
+            return None, None
+
+        # 3. Check success/failure
+        if not response.success:
+            logerr(f"Planning failed: {response.message}")
+            return None, None
+
+        # 4. Parse the JSON result from response.message
+        try:
+            posture_dict = json.loads(response.message)
+        except json.JSONDecodeError:
+            logerr(f"Could not parse JSON from service response: {response.message}")
+            return None, None
+
+        # posture_dict should now be { "joint1_name": value, "joint2_name": value, ... }
+        #loginfo("Planning succeeded. Final joint posture (parsed from JSON):")
+        joint_names = list(posture_dict.keys())
+        joint_positions = list(posture_dict.values())
+        return (joint_names, joint_positions)
+
 
     def _moveit_ik_solver(self, eef_pos, eef_quat_xyzw, finger_val):
         """
@@ -378,7 +433,10 @@ class GoogleRobotOpenPiZeroInferenceNode:
         pose_goal.orientation.z = float(eef_quat_xyzw[2])
         pose_goal.orientation.w = float(eef_quat_xyzw[3])
 
-        joint_names, positions = self.moveit_server_plan(pose_goal)
+        joint_names, positions = self.moveit_server_plan_arm(pose_goal)
+
+        if joint_names is None:
+            return None
 
         plan_joint_map = {}
         for i, jn in enumerate(joint_names):
@@ -403,12 +461,12 @@ class GoogleRobotOpenPiZeroInferenceNode:
 
         # Overwrite the head joints (to look at the coke-can)
         if "joint_head_pan" in self.joint_names:
-            idx_left = self.joint_names.index("joint_head_pan")
-            new_positions[idx_left] = -0.48
+            idx_pan = self.joint_names.index("joint_head_pan")
+            new_positions[idx_pan] = 0.0
         if "joint_head_tilt" in self.joint_names:
-            idx_right = self.joint_names.index("joint_head_tilt")
-            new_positions[idx_right] = 0.8
-        print(new_positions)
+            idx_tilt = self.joint_names.index("joint_head_tilt")
+            new_positions[idx_tilt] = 0.8
+
         return new_positions
 
     def _send_joint_trajectory(self, target_joint_positions):

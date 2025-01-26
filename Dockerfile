@@ -38,7 +38,7 @@ RUN uv sync && \
     uv pip install -e . ./SimplerEnv --no-config && \
     uv pip install -e . ./SimplerEnv/ManiSkill2_real2sim --no-config && \
     rm pyproject.toml && \
-    uv pip install --extra-index-url https://rospypi.github.io/simple rospy-all tf tf2_ros
+    uv pip install --extra-index-url https://rospypi.github.io/simple rospy-all tf tf2_ros std-srvs
 #   uv pip install --extra-index-url https://rospypi.github.io/simple cv_bridge
 #   uv pip install /root/workspace/open-pi-zero
 
