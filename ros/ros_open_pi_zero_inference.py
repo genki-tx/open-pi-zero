@@ -14,6 +14,7 @@ from collections import deque
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from geometry_msgs.msg import Pose
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
 import tf
 import tf.transformations as tr
@@ -25,6 +26,7 @@ from omegaconf import OmegaConf
 # Make sure pizero.py is on your PYTHONPATH or in the same directory
 # e.g. from my_robot_inference.pizero import PiZeroInference
 from src.model.vla.pizero import PiZeroInference
+from src.agent.env_adapter.simpler import EDRSimplerAdapter
 
 # Workaround for rospy-all deserialization issue in Python 3.10
 # ------------------------------------------------------------
@@ -62,9 +64,13 @@ def load_checkpoint(model, checkpoint_path):
     """
     # 'weights_only=True' in your example, but if your .pt might have a different structure, adapt as needed.
     ckpt_data = torch.load(checkpoint_path, weights_only=True, map_location="cpu")
-    # remove "_orig_mod." prefix if saved model was compiled
-    ckpt_data["model"] = {k.replace("_orig_mod.", ""): v for k, v in ckpt_data["model"].items()}
-    model.load_state_dict(ckpt_data["model"], strict=True)
+    if "model" in ckpt_data:
+        # Remove any prefix if saved model was compiled
+        ckpt_data["model"] = {k.replace("_orig_mod.", ""): v for k, v in ckpt_data["model"].items()}
+        model.load_state_dict(ckpt_data["model"], strict=True)
+    else:
+        # else assume the entire state_dict is in ckpt_data
+        model.load_state_dict(ckpt_data, strict=True)
     loginfo(f"PiZeroInference model loaded from {checkpoint_path}")
 
 
@@ -79,7 +85,6 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.use_torch_compile = rospy.get_param("~use_torch_compile", True)
         flow_sampling = rospy.get_param("~flow_sampling", "beta") # "beta" or "uniform"
 
-        # For demonstration, these are the relevant joints in "google_arm_controller"
         self.joint_names = [
             "joint_torso", "joint_shoulder", "joint_bicep", "joint_elbow",
             "joint_forearm", "joint_wrist", "joint_gripper",
@@ -99,6 +104,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         # Load the PiZero config from a YAML or .py-based Hydra config
         self.cfg = OmegaConf.load(self.config_path)  # e.g. "config/eval/bridge.yaml"
         loginfo(f"[PiZero] Loaded config from {self.config_path}")
+        self.cfg.env.adapter.dataset_statistics_path = f"/workspaces/open-pi-zero/{self.cfg.env.adapter.dataset_statistics_path}"
 
         # determine flow matching schedule
         self.cfg.flow_sampling = flow_sampling
@@ -114,6 +120,10 @@ class GoogleRobotOpenPiZeroInferenceNode:
             self.model = torch.compile(self.model, mode="default")
         self.model.eval()
         loginfo(f"[PiZero] Model moved to {self.device} with dtype={self.dtype}")
+
+        self.adapter:EDRSimplerAdapter = hydra.utils.instantiate(self.cfg.env.adapter)
+        self.adapter.reset()
+
         # For image resizing
         self.model_input_width = self.cfg.env.adapter.image_size[0]
         self.model_input_height = self.cfg.env.adapter.image_size[1]
@@ -133,44 +143,30 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.tf_listener = tf.TransformListener()
 
         # Setup ActionLib client for joint trajectory
-        self.client = actionlib.SimpleActionClient("/google_arm_controller/follow_joint_trajectory",
+        self.client = actionlib.SimpleActionClient("/google_fullbody_controller/follow_joint_trajectory",
                                                    FollowJointTrajectoryAction)
-        loginfo("Waiting for google_arm_controller action server ...")
+        loginfo("Waiting for google_fullbody_controller action server ...")
         self.client.wait_for_server()
-        loginfo("Connected to google_arm_controller action server.")
+        loginfo("Connected to google_fullbody_controller action server.")
 
         # Start a periodic timer to run inference + publish commands
         rospy.Timer(rospy.Duration(1.0 / self.loop_rate_hz), self._control_loop)
 
     def _image_callback(self, msg: Image):
         """
-        Convert the camera image to a fixed 224x224 BGR or RGB (depending on your model).
-        We'll store as a torch.uint8 (3 x 224 x 224).
+        Store the camera image. 
+        Here, we'll keep it in HWC format so we can easily resize or process with OpenCV.
         """
         try:
-            # if you already have un-precessed value, skip the process to save CPU resources
-            #if self.latest_image:
-            #    return
-
-            # Extract image dimensions
-            width = msg.width
-            height = msg.height
-            channels = 3  # For BGR8 images
-
-            # Convert image data to a NumPy array
-            img_array = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, channels))
-
-            # Resize to model input shape
-            resized = cv2.resize(img_array, (self.model_input_width, self.model_input_height), interpolation=cv2.INTER_AREA)
-
-            # Convert to CHW torch.uint8
-            resized_chw = np.transpose(resized, (2, 0, 1))  # shape (3, 224, 224)
-
-            # Make a torch tensor
-            image_tensor = torch.from_numpy(resized_chw).type(torch.uint8)
-            self.latest_image = image_tensor
+            height, width = msg.height, msg.width
+            channels = 3  # RGB8
+            if msg.encoding == 'rgb8':
+                img = np.frombuffer(msg.data, dtype=np.uint8).reshape((height, width, channels))
+            else:
+                raise Exception(f"image format {msg.encoding} is not supported yet")
+            self.latest_image = img  # shape (H, W, 3) RGB8
         except Exception as e:
-            logwarn(f"Failed to convert/resize camera image: {e}")
+            logwarn(f"Failed to convert camera image: {e}")
             self.latest_image = None
 
     def _joint_state_callback(self, msg: JointState):
@@ -184,23 +180,93 @@ class GoogleRobotOpenPiZeroInferenceNode:
 
         self.latest_joints = name_to_pos
 
+    def _prepare_model_inputs(self, eef_pos, eef_quat_xyzw, gripper_openness):
+        """
+        Manually build PiZero model inputs without calling simpler.py's 'preprocess()'.
+        We'll do:
+          - Image => resized to model's input size
+          - Dummy text tokens & attention masks
+          - Normalized 8D proprio if your model training expects that
+        """
+        # self.latest_image is shape (H,W,3) RGB
+        # Resize to your model's input resolution
+        resized_image = cv2.resize(
+            self.latest_image,
+            (self.cfg.env.adapter.image_size[0], self.cfg.env.adapter.image_size[1]),
+            interpolation=cv2.INTER_AREA
+        )
+        # Convert to torch (B=1,3,H,W)
+        images = torch.as_tensor(resized_image, dtype=torch.uint8).permute(2, 0, 1)[
+            None
+        ]  # [1, 3, H, W]
+        instruction = "Pick a coke-can"
+        model_inputs = self.adapter.processor(text=[instruction], images=images)
+
+        # 3) Build normalized proprio (8D)
+        #    If your model was trained with [-1..1] bounding, do the same here.
+        gripper_closedness = 1.0 - gripper_openness # fractal in open-pi-zero requires closedness
+        raw_proprio = np.concatenate([eef_pos, eef_quat_xyzw, [gripper_closedness]], axis=0)  # shape (3+4+1=8,)
+
+        # normalize proprios - gripper opening is normalized
+        if self.adapter.proprio_normalization_type == "bound":
+            proprio = self.adapter.normalize_bound(
+                raw_proprio,
+                np.array(self.adapter.dataset_statistics["proprio"]["p01"]),
+                np.array(self.adapter.dataset_statistics["proprio"]["p99"]),
+                clip_min=-1,
+                clip_max=1,
+            )
+        elif self.adapter.proprio_normalization_type == "gaussian":
+            proprio = self.adapter.normalize_gaussian(
+                raw_proprio,
+                np.array(self.dataset_statistics["proprio"]["mean"]),
+                np.array(self.dataset_statistics["proprio"]["std"]),
+            )
+
+        causal_mask, vlm_position_ids, proprio_position_ids, action_position_ids = (
+            self.model.build_causal_mask_and_position_ids(
+                model_inputs["attention_mask"], dtype=self.dtype
+            )
+        )
+
+        image_text_proprio_mask, action_mask = self.model.split_full_mask_into_submasks(
+            causal_mask
+        )
+
+        inputs = {
+            "input_ids": model_inputs["input_ids"],
+            "pixel_values": model_inputs["pixel_values"].to(self.dtype),
+            "image_text_proprio_mask": image_text_proprio_mask,
+            "action_mask": action_mask,
+            "vlm_position_ids": vlm_position_ids,
+            "proprio_position_ids": proprio_position_ids,
+            "action_position_ids": action_position_ids,
+            "proprios": torch.as_tensor(proprio, dtype=torch.float32)[
+                None, None
+            ].to(self.dtype), # [B, T, dim]
+        }
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        return inputs
+
     def _control_loop(self, _event):
         """
         Called periodically at ~loop_rate_hz to:
-          1) Read EEF pose from TF + finger angles => build 8D 'proprio'
-          2) Prepare PiZero model inputs (img, text, mask, proprio, etc.)
-          3) Run the PiZero inference => 7D EEF delta + gripper delta
-          4) Convert EEF delta to new EEF pose
-          5) Solve IK (or use a PD EEF controller) to get joint angles
-          6) Send the resulting joint command to the trajectory controller
+          - Read EEF pose from TF + finger angles => build 8D 'proprio'
+          - Prepare PiZero model inputs (img, text, mask, proprio, etc.)
+          - Run the PiZero inference => 7D EEF delta + gripper delta
+          - Convert EEF delta to new EEF pose
+          - Solve IK (or use a PD EEF controller) to get joint angles
+          - Send the resulting joint command to the trajectory controller
         """
         self.timer_count += 1
 
-        # 0) Check we have the latest camera image, finger joint states
+        # Check we have the latest camera image, finger joint states
         if self.latest_image is None or self.latest_joints is None:
             return
 
-        # 1) Gather EEF pose from TF
+        start_t = time.time()
+
+        # Gather EEF pose from TF
         try:
             # If your root frame is "world", and child is "link_gripper_tcp"
             now = rospy.Time(0)
@@ -210,184 +276,152 @@ class GoogleRobotOpenPiZeroInferenceNode:
             (trans, rot) = self.tf_listener.lookupTransform("link_base", "link_gripper_tcp", now)
             # trans => (x,y,z), rot => (qx,qy,qz,qw)
             eef_pos = np.array(trans, dtype=np.float32)
-            eef_quat = np.array(rot, dtype=np.float32)
+            eef_quat_xyzw  = np.array(rot, dtype=np.float32)
         except Exception as e:
             rospy.logwarn(f"Could not lookup TF for link_gripper_tcp: {e}")
             return
 
-        # 2) Compute 'gripper_opening' from finger joints
+        # Compute 'gripper_opening' from finger joints
         #    Assume 'joint_finger_left' and 'joint_finger_right' each in [0..1.3]
         left_finger = self.latest_joints.get("joint_finger_left", 0.0)
         right_finger = self.latest_joints.get("joint_finger_right", 0.0)
-        max_range = 1.3
+        gripper_max_range = 1.3
         # If 0 => open, 1.3 => closed, define 'gripper_opening' in [0..1]
         # Depending on how you used it in training, you might do the inverse
         # E.g. 0=closed, 1=open => adjust to match training.
-        gripper_opening = 1.0 - ((left_finger + right_finger) / (2.0 * max_range))
+        gripper_openness = 1.0 - ((left_finger + right_finger) / (2.0 * gripper_max_range))
 
-        # 3) Build the 8D 'proprio' for the model
-        # Format: [x, y, z, qx, qy, qz, qw, gripper_opening]
-        proprio_np = np.concatenate([eef_pos, eef_quat, [gripper_opening]], axis=0)
+        # Prepare the model inputs
+        model_inputs = self._prepare_model_inputs(eef_pos, eef_quat_xyzw, gripper_openness)
 
-        # 4) Prepare the model inputs
-        model_inputs = self._prepare_model_inputs(
-            img_tensor=self.latest_image,   # (3,224,224) uint8
-            proprio_np=proprio_np           # shape (8,)
-            # If you still want to pass text tokens, etc., adapt _prepare_model_inputs accordingly.
-        )
-
-        # 5) Run PiZero inference
-        start_t = time.time()
+        # Forward pass, Run PiZero inference
         with torch.inference_mode():
             predicted_actions = self.model(**model_inputs)  # -> shape [B, horizon_steps, 7]
         infer_dt = time.time() - start_t
 
-        # 6) Log inference time stats
+        # Log inference time stats
         self.inference_time_buffer.append(infer_dt)
         if self.timer_count % 10 == 0:
             t_arr = np.array(self.inference_time_buffer, dtype=np.float32)
             rospy.loginfo(
                 f"[PiZero Inference] avg={t_arr.mean():.3f}s, min={t_arr.min():.3f}s, max={t_arr.max():.3f}s, n={len(t_arr)}"
             )
+        predicted_actions = predicted_actions[0].to(torch.float32).cpu().numpy() # shape (T,7), convert BF16 to FP32
 
-        # Usually B=1, so pick predicted_actions[0] => shape (horizon_steps, 7)
-        if predicted_actions.dim() == 3:
-            predicted_actions = predicted_actions[0]
+        # Denormalize action, gripper action is not normalized in training dataset
+        if self.adapter.action_normalization_type == "bound":
+            raw_actions_except_gripper = self.adapter.denormalize_bound(
+                predicted_actions[:, :-1],
+                np.array(self.adapter.dataset_statistics["action"]["p01"])[:-1],
+                np.array(self.adapter.dataset_statistics["action"]["p99"])[:-1],
+                clip_min=-1,
+                clip_max=1,
+            )
+        elif self.adapter.action_normalization_type == "gaussian":
+            raw_actions_except_gripper = self.adapter.denormalize_gaussian(
+                predicted_actions[:, :-1],
+                np.array(self.adapter.dataset_statistics["action"]["mean"])[:-1],
+                np.array(self.adapter.dataset_statistics["action"]["std"])[:-1],
+            )
+        raw_actions = np.concatenate(
+            [
+                raw_actions_except_gripper,
+                predicted_actions[:, -1:],
+            ],
+            axis=1,
+        )
 
-        # We'll just take the first step's predicted action
-        eef_delta = predicted_actions[0].to(torch.float32).cpu().numpy()  # shape (7,), convert BF16 to FP32
+        for eef_delta in raw_actions[: self.cfg.act_steps]: # in fractal, usually act_steps = 2
+            # Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
+            # For simplicity, let's parse them
+            dx, dy, dz, ax, ay, az, gripper_action = eef_delta
+            # Update position
+            new_pos = eef_pos + np.array([dx, dy, dz], dtype=np.float32)
+            # Convert axis-angle to a new orientation
+            angle = np.linalg.norm([ax, ay, az])
+            if angle < 1e-8:
+                new_quat_xyzw = eef_quat_xyzw
+            else:
+                axis = np.array([ax, ay, az], dtype=np.float32) / angle
+                delta_quat = tr.quaternion_about_axis(angle, axis)  # [x, y, z, w]
+                new_quat_xyzw = tr.quaternion_multiply(eef_quat_xyzw, delta_quat)
 
-        # 7) Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
-        # For simplicity, let's parse them
-        dx, dy, dz, droll, dpitch, dyaw, dgrip = eef_delta
+            new_gripper_val = gripper_max_range * gripper_action # in fractal, 1 is closed = 1.3rad, 0 is opened = 0 rad
+            new_joint_positions = self._moveit_ik_solver(new_pos, new_quat_xyzw, new_gripper_val)
+            if new_joint_positions is None:
+                logwarn("MoveIt IK solver failed. Skipping command.")
+                return
+            break # for now, just run 1 step
 
-        # a) Update position
-        new_eef_pos = eef_pos + np.array([dx, dy, dz], dtype=np.float32)
+        # Publish a JointTrajectory
+        self._send_joint_trajectory(new_joint_positions)
 
-        # b) Update orientation (naive approach in euler)
-        # If you have small rotations each step, you can do something like:
-        current_euler = np.array(tr.euler_from_quaternion(eef_quat), dtype=np.float32)
-        new_euler = current_euler + np.array([droll, dpitch, dyaw], dtype=np.float32)
-        new_quat  = tr.quaternion_from_euler(*new_euler).astype(np.float32)
+        # Clear buffers so next loop waits for new sensor data
+        self.latest_image = None
+        self.latest_joints = None
 
-        # c) Update gripper
-        new_gripper_opening = np.clip(gripper_opening + dgrip, 0.0, 1.0)
+    def moveit_server_plan(self, pose_goal):
+        joint_names =  ['joint_torso', 'joint_shoulder', 'joint_bicep', 'joint_elbow', 'joint_forearm', 'joint_wrist', 'joint_gripper']
+        positions = [0.0, 0.435, 0.0, 2.33, 0.0, -1.21, 0.0]
+        return (joint_names, positions)
 
-        # 8) Solve IK or feed to an EEF-delta controller
-        #    - If you have your own IK, do something like:
-        #       new_joint_positions = self.do_ik(new_eef_pos, new_quat)
-        #    - Or if you have a PD approach, you might skip the direct IK and just publish a "delta pose" to a custom controller.
-        # For demonstration, let's do a dummy "IK" to show how to build a joint trajectory:
-        new_joint_positions = self._dummy_ik_solver(new_eef_pos, new_quat, new_gripper_opening)
+    def _moveit_ik_solver(self, eef_pos, eef_quat_xyzw, finger_val):
+        """
+        Use MoveIt to plan from the current state to the new EEF pose, then embed the finger joint.
+        """
+        pose_goal = Pose()
+        pose_goal.position.x = float(eef_pos[0])
+        pose_goal.position.y = float(eef_pos[1])
+        pose_goal.position.z = float(eef_pos[2])
+        pose_goal.orientation.x = float(eef_quat_xyzw[0])
+        pose_goal.orientation.y = float(eef_quat_xyzw[1])
+        pose_goal.orientation.z = float(eef_quat_xyzw[2])
+        pose_goal.orientation.w = float(eef_quat_xyzw[3])
 
-        # 9) Build a JointTrajectory for google_arm_controller
+        joint_names, positions = self.moveit_server_plan(pose_goal)
+
+        plan_joint_map = {}
+        for i, jn in enumerate(joint_names):
+            plan_joint_map[jn] = positions[i]
+
+        # Build a full array for all 11 joints in the correct order
+        new_positions = []
+        for jn in self.joint_names:
+            if jn in plan_joint_map:
+                new_positions.append(plan_joint_map[jn])
+            else:
+                curr_pos = self.latest_joints.get(jn, 0.0)
+                new_positions.append(curr_pos)
+
+        # Overwrite the finger joints
+        if "joint_finger_left" in self.joint_names:
+            idx_left = self.joint_names.index("joint_finger_left")
+            new_positions[idx_left] = finger_val
+        if "joint_finger_right" in self.joint_names:
+            idx_right = self.joint_names.index("joint_finger_right")
+            new_positions[idx_right] = finger_val
+
+        # Overwrite the head joints (to look at the coke-can)
+        if "joint_head_pan" in self.joint_names:
+            idx_left = self.joint_names.index("joint_head_pan")
+            new_positions[idx_left] = -0.48
+        if "joint_head_tilt" in self.joint_names:
+            idx_right = self.joint_names.index("joint_head_tilt")
+            new_positions[idx_right] = 0.8
+        print(new_positions)
+        return new_positions
+
+    def _send_joint_trajectory(self, target_joint_positions):
         traj = JointTrajectory()
-        traj.joint_names = self.joint_names  # e.g. 11 joints
+        traj.joint_names = self.joint_names
         pt = JointTrajectoryPoint()
-        pt.positions = new_joint_positions
+        pt.positions = target_joint_positions
         pt.time_from_start = rospy.Duration(1.0)
         traj.points.append(pt)
 
         goal = FollowJointTrajectoryGoal()
         goal.trajectory = traj
         self.client.send_goal(goal)
-        # self.client.wait_for_result(rospy.Duration(2.0))
-
-        # 10) Clear the buffers so we wait for next fresh image + fresh finger states
-        self.latest_image = None
-        self.latest_joints = None
-
-    def _prepare_model_inputs(self, img_tensor: torch.Tensor, proprio_np: np.ndarray):
-        """
-        Convert the camera image + 8D proprio array into the PiZero model's required format.
-        This matches the logic from 'try_checkpoint_in_simpler.py' when using:
-           max_image_text_tokens=276 (256 image tokens + up to 20 text tokens).
-
-        :param img_tensor: (3, 224, 224) torch.uint8 from your camera callback.
-        :param proprio_np: (8,) np.ndarray = [EEF_x, EEF_y, EEF_z, EEF_quat, gripper_open].
-        :return: dict with keys matching PiZeroInference.forward().
-        """
-        # 1) Single-batch dimension
-        bsz = 1
-    
-        # 2) Move/reshape image to (B,3,224,224) on the right device + dtype
-        pixel_values = img_tensor.unsqueeze(0).to(device=self.device, dtype=self.dtype)
-        # shape => (1, 3, 224, 224)
-    
-        # 3) Construct dummy text inputs (seq_length=10 for example)
-        #    Typically the first 256 tokens denote "image tokens."
-        seq_len = 276
-        num_img_tokens = 256
-        img_idx = getattr(self.model, "image_token_index", 257152)  # default if not found
-        # Create a [B, 276] LongTensor 
-        input_ids = torch.full(
-            (bsz, seq_len),
-            fill_value=2,  # e.g. some "text token" for the non-image portion
-            dtype=torch.long,
-            device=self.device,
-        )
-        # Overwrite the first 256 positions with the image_token_index => image tokens
-        input_ids[:, :num_img_tokens] = img_idx
-
-        # A full attention mask of 1's
-        attention_mask = torch.ones((bsz, seq_len), dtype=torch.long, device=self.device)
-    
-        # 4) Build the PiZero causal masks + positions
-        causal_mask, vlm_pos_ids, proprio_pos_ids, action_pos_ids = (
-            self.model.build_causal_mask_and_position_ids(attention_mask, dtype=self.dtype)
-        )
-        image_text_proprio_mask, action_mask = self.model.split_full_mask_into_submasks(
-            causal_mask
-        )
-    
-        # 5) Convert the proprio to torch, shape => (B, cond_steps=1, proprio_dim=8)
-        proprios = (
-            torch.from_numpy(proprio_np)
-            .float()
-            .unsqueeze(0)  # B=1
-            .unsqueeze(1)  # cond_steps=1
-            .to(self.device, dtype=self.dtype)
-        )  # => shape (1, 1, 8)
-    
-        # 6) Assemble the final dictionary for PiZero
-        model_inputs = {
-            "input_ids": input_ids,
-            "pixel_values": pixel_values,
-            "image_text_proprio_mask": image_text_proprio_mask.to(self.device),
-            "action_mask": action_mask.to(self.device),
-            "vlm_position_ids": vlm_pos_ids.to(self.device),
-            "proprio_position_ids": proprio_pos_ids.to(self.device),
-            "action_position_ids": action_pos_ids.to(self.device),
-            "proprios": proprios,
-        }
-        return model_inputs
-
-    def _send_joint_trajectory(self, target_joint_positions):
-        """
-        Example single-point trajectory. You must ensure your 'google_arm_controller'
-        is a position-based trajectory controller that expects a point for each
-        of your 11 joints in the exact same order as self.joint_names.
-        """
-        if len(target_joint_positions) != self.num_joints:
-            logwarn(
-                f"_send_joint_trajectory: mismatch: got {len(target_joint_positions)} actions vs {self.num_joints} joints"
-            )
-            return
-
-        traj = JointTrajectory()
-        traj.joint_names = self.joint_names
-
-        pt = JointTrajectoryPoint()
-        pt.positions = target_joint_positions.tolist()
-        pt.time_from_start = rospy.Duration(1.0)  # 1 second to move
-        traj.points.append(pt)
-
-        goal = FollowJointTrajectoryGoal()
-        goal.trajectory = traj
-
-        self.client.send_goal(goal)
-        # Optionally wait for result, or just send & forget
-        # self.client.wait_for_result(rospy.Duration(2.0))
 
     def spin(self):
         rospy.spin()
