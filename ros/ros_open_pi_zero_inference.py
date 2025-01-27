@@ -82,7 +82,7 @@ def load_checkpoint(model, checkpoint_path):
 class GoogleRobotOpenPiZeroInferenceNode:
     def __init__(self):
         # --- ROS Params ---
-        self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 2.0)
+        self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 0.2)
         self.checkpoint_path = rospy.get_param("~checkpoint_path", "/root/workspace/dataset/vla_log/2025-01-20_00-22_42_fractal_beta/checkpoint/step147900.pt")
         self.config_path = rospy.get_param("~config_path", "/root/workspace/open-pi-zero/config/eval/fractal_apple.yaml")
         self.gpu_id = rospy.get_param("~gpu_id", 0)
@@ -90,12 +90,17 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.use_torch_compile = rospy.get_param("~use_torch_compile", True)
         flow_sampling = rospy.get_param("~flow_sampling", "beta") # "beta" or "uniform"
 
+        loginfo(f"loop_rate_hz: {self.loop_rate_hz}")
+
         self.joint_names = [
             "joint_torso", "joint_shoulder", "joint_bicep", "joint_elbow",
             "joint_forearm", "joint_wrist", "joint_gripper",
             "joint_finger_right", "joint_finger_left", "joint_head_pan", "joint_head_tilt"
         ]
         self.num_joints = len(self.joint_names)
+        self.latest_image = None
+        self.latest_joints = None
+        self.inference_busy = False
 
         # seeding
         random.seed(0)
@@ -144,10 +149,10 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.tf_listener = tf.TransformListener()
 
         # Setup ActionLib client for joint trajectory
-        self.client = actionlib.SimpleActionClient("/google_fullbody_controller/follow_joint_trajectory",
+        self.ros_control_client = actionlib.SimpleActionClient("/google_fullbody_controller/follow_joint_trajectory",
                                                    FollowJointTrajectoryAction)
         loginfo("Waiting for google_fullbody_controller action server ...")
-        self.client.wait_for_server()
+        self.ros_control_client.wait_for_server()
         loginfo("Connected to google_fullbody_controller action server.")
 
         # Setup motion planner communication
@@ -217,7 +222,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         # Convert to torch (B=1,3,H,W)
         images = torch.as_tensor(resized_image, dtype=torch.uint8).permute(2, 0, 1)[
             None
-        ]  # [1, 3, H, W]
+        ] # [1, 3, H, W]
         instruction = "Pick a coke-can"
         model_inputs = self.adapter.processor(text=[instruction], images=images)
 
@@ -273,6 +278,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.inference_busy = False
 
     def _control_loop(self, _event):
+        print('============ control_loop')
         """
         Called periodically at ~loop_rate_hz to:
           - Read EEF pose from TF + finger angles => build 8D 'proprio'
@@ -300,9 +306,9 @@ class GoogleRobotOpenPiZeroInferenceNode:
             # If your root frame is "world", and child is "link_gripper_tcp"
             now = rospy.Time(0)
             self.tf_listener.waitForTransform(
-                "link_base", "link_gripper_tcp", now, rospy.Duration(0.5)
+                "world", "link_gripper_tcp", now, rospy.Duration(0.5)
             )
-            (trans, rot) = self.tf_listener.lookupTransform("link_base", "link_gripper_tcp", now)
+            (trans, rot) = self.tf_listener.lookupTransform("world", "link_gripper_tcp", now)
             # trans => (x,y,z), rot => (qx,qy,qz,qw)
             eef_pos = np.array(trans, dtype=np.float32)
             eef_quat_xyzw  = np.array(rot, dtype=np.float32)
@@ -364,28 +370,25 @@ class GoogleRobotOpenPiZeroInferenceNode:
         for eef_delta in raw_actions[: self.cfg.act_steps]: # in fractal, usually act_steps = 2
             # Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
             # For simplicity, let's parse them
-            dx, dy, dz, ax, ay, az, gripper_action = eef_delta
+            dx, dy, dz, roll, pitch, yaw, gripper_action = eef_delta
             # Update position
             new_pos = eef_pos + np.array([dx, dy, dz], dtype=np.float32)
             # Convert axis-angle to a new orientation
-            angle = np.linalg.norm([ax, ay, az])
-            if angle < 1e-8:
-                new_quat_xyzw = eef_quat_xyzw
-            else:
-                axis = np.array([ax, ay, az], dtype=np.float32) / angle
-                delta_quat = tr.quaternion_about_axis(angle, axis)  # [x, y, z, w]
-                new_quat_xyzw = tr.quaternion_multiply(eef_quat_xyzw, delta_quat)
+            delta_quat_euler = tr.quaternion_from_euler(roll, pitch, yaw, axes='sxyz')
+            new_quat_xyzw = tr.quaternion_multiply(eef_quat_xyzw, delta_quat_euler)
 
-            new_gripper_val = gripper_max_range * gripper_action # in fractal, 1 is closed = 1.3rad, 0 is opened = 0 rad
+            gripper_max_range = 0.8 # half-open
+            new_gripper_val = gripper_max_range * 0.5 * (gripper_action + 1) # in fractal, 1 is closed = 1.3rad, -1 is opened = 0 rad
             new_joint_positions = self._moveit_ik_solver(new_pos, new_quat_xyzw, new_gripper_val)
             if new_joint_positions is None:
                 logwarn("MoveIt IK solver failed. Skipping command.")
                 self._clear_states()
                 return
-            break # for now, just run 1 step
-
-        # Publish a JointTrajectory
-        self._send_joint_trajectory(new_joint_positions)
+            # Publish a JointTrajectory
+            self._send_joint_trajectory(new_joint_positions)
+            eef_pos = new_pos
+            eef_quat_xyzw = new_quat_xyzw
+            break
 
         # Clear buffers so next loop waits for new sensor data
         self._clear_states()
@@ -481,7 +484,9 @@ class GoogleRobotOpenPiZeroInferenceNode:
 
         goal = FollowJointTrajectoryGoal()
         goal.trajectory = traj
-        self.client.send_goal(goal)
+        self.ros_control_client.send_goal(goal)
+        self.ros_control_client.wait_for_result(rospy.Duration(5.0))
+        print("=== joint trajectory reached")
 
     def _move_initial_pose(self):
         initial_pose = [0.0, 0.1432, 0.1476, 1.22, 0.0, 0.93, -1.394, 0.4, 0.4, 0.0, 0.8]
