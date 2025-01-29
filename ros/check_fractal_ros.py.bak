@@ -22,6 +22,8 @@ from geometry_msgs.msg import Pose, TwistStamped
 from std_srvs.srv import Trigger
 import tf
 import tf.transformations as tr
+print('==================== start')
+
 class RosIf():
     def __init__(self):
         self.init()
@@ -31,20 +33,14 @@ class RosIf():
         self.joint_state_sub = rospy.Subscriber("/joint_states", JointState, self._joint_state_callback, queue_size=1)
         self.tf_listener = tf.TransformListener()
 
-        self.ros_control_client = actionlib.SimpleActionClient("/google_fullbody_trajectory_controller/follow_joint_trajectory",
+        self.ros_control_client = actionlib.SimpleActionClient("/google_fullbody_controller/follow_joint_trajectory",
                                                    FollowJointTrajectoryAction)
-        print("waiting for /google_fullbody_trajectory_controller/follow_joint_trajectory...")
         self.ros_control_client.wait_for_server()
 
-        self.moveit_pose_pub = rospy.Publisher("/moveit_server/planning_pose", Pose, queue_size=1, latch=True)
-        print("waiting for /moveit_server services...")
+        self.moveit_pose_pub = rospy.Publisher("/moveit_server/target_pose", Pose, queue_size=1, latch=True)
         rospy.wait_for_service("/moveit_server/plan_arm")
-        rospy.wait_for_service("/moveit_server/switch_controller_position_group")
-        rospy.wait_for_service("/moveit_server/switch_controller_trajectory")
-        self.srv_moveit_plan_arm = rospy.ServiceProxy("/moveit_server/plan_arm", Trigger)
-        self.srv_switch_controller_pos = rospy.ServiceProxy("/moveit_server/switch_controller_position_group", Trigger)
-        self.srv_switch_controller_trj = rospy.ServiceProxy("/moveit_server/switch_controller_trajectory", Trigger)
-
+        self.moveit_plan_arm = rospy.ServiceProxy("/moveit_server/plan_arm", Trigger)
+        
         self.servo_pub = rospy.Publisher("/servo_server/delta_twist_cmds", TwistStamped, queue_size=1)
 
     def _joint_state_callback(self, msg: JointState):
@@ -99,7 +95,7 @@ class RosIf():
         self.moveit_pose_pub.publish(pose_goal)
 
         try:
-            response = self.srv_moveit_plan_arm()
+            response = self.moveit_plan_arm()
         except rospy.ServiceException as e:
             rospy.logerr(f"Service call failed: {e}")
             return None, None
@@ -138,13 +134,13 @@ class RosIf():
         goal = FollowJointTrajectoryGoal()
         goal.trajectory = traj
         self.ros_control_client.send_goal(goal)
-    
+
     # Suppose you have a policy action: dx, dy, dz, droll, dpitch, dyaw in local frame
     # and you want to apply it over dt=0.2 s at 10 Hz => 2 messages
     def apply_action_with_servo(self, dx, dy, dz, droll, dpitch, dyaw, time_scale=1.0):
         msg = TwistStamped()
         msg.header.stamp = rospy.Time.now()
-        msg.header.frame_id = "link_base"
+        msg.header.frame_id = "base_link"
 
         msg.twist.linear.x = dx * time_scale
         msg.twist.linear.y = dy * time_scale
@@ -155,44 +151,32 @@ class RosIf():
 
         self.servo_pub.publish(msg)
     
-    def switch_controllers(self, mode):
-        try:
-            if mode == 'trajectory':
-                response = self.srv_switch_controller_trj()
-            elif mode == 'position':
-                response = self.srv_switch_controller_pos()
-            else:
-                rospy.logerr("Invalid mode. Use 'trajectory' for trajectory controller or 'position' for position controller.")
-                return
-            if response.success:
-                rospy.loginfo("Controllers switched successfully.")
-            else:
-                rospy.logerr("Failed to switch controllers.")
-        except rospy.ServiceException as e:
-            rospy.logerr(f"Service call failed: {e}")
-    
     def sleep_spin(self, duration_sec):
-        duration_msec = int(duration_sec * 1000.0)
+        duration_msec = duration_sec * 1000.0
         rate = rospy.Rate(1000)
         for _ in range(duration_msec):
             rate.sleep()
 
 def main():
+    print('load start 0')
+    
     config_path = "/workspaces/open-pi-zero/config/train/fractal.yaml"
     stats_path = "/workspaces/open-pi-zero/config/fractal_statistics.json"
     adapter = BaseEnvAdapter()
+    print('load start')
 
     # Load the exact same config YAML as used in your training script
     cfg = OmegaConf.load(config_path)
     with open(stats_path, "r") as f:
         dataset_statistics = json.load(f)
 
+    print('ros start')
     rosif = RosIf()
-    rosif.switch_controllers("trajectory")
-
+    print('ros end')
     # Initialize dataset, note that dataset will be normalized while loading
     dataset_obj = TorchRLDSInterleavedDataset(cfg.data.train, train=False)
     dataset = dataset_obj.dataset
+    print('TorchRLDSInterleavedDataset end')
     loader = DataLoader(dataset, batch_size=1, shuffle=False, drop_last=False)
     data_iter = iter(loader)
     batch = next(data_iter)
@@ -240,7 +224,7 @@ def main():
         print("ERROR: Motion planning failed")
         return
     rosif.send_joint_trajectory(dict_new_joint_positions)
-    rosif.sleep_spin(3)
+    rosif.sleep_spin(5)
 
     # Get robot's posture after the motion in Gazebo, ROS
     (trans, rot) = rosif.lookup_transform("link_base", "link_gripper")
@@ -275,53 +259,37 @@ def main():
     dist = denorm_proprio - raw_proprio_ros
     print(f"Distance:\n{dist}")
 
-    user_input = input("press any key to start action validation...")
-    rosif.switch_controllers("position")
+    # Let's validate action side
+    T = obs["proprio"].shape[1]
+    num_steps_to_replay = min(T - 1, 5)  # let's do 5 steps or T-1 if smaller
 
-    num_batches = 100
-    for i in range(num_batches):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            print("No more data in the loader.")
-            break
-    
-        act = batch["action"]
+    # Loop over time steps for action evaluation
+    for t in range(num_steps_to_replay):
+        print(obs["proprio"][0, t] - norm_proprio)
+        # Apply the dataset action a_t for 1 "time step"
+        #     (i.e. parse the action, convert to EEF delta, do IK, etc.)
+        norm_action_t = act[0, t].cpu().numpy()
+        # e.g. shape (7,). If your dataset uses chunked actions, might be shape (horizon, 7)
+        # This should be the same as PiZero model inference output
 
-        # Let's validate action side
-        T = act.shape[1]  # number of time steps in this batch
-        num_steps_to_replay = min(T, 5)
+        # Denormalize
+        raw_action_except_gripper = adapter.denormalize_bound(
+            norm_action_t[:-1],  # first 6 dims
+            np.array(dataset_statistics["action"]["p01"])[:-1],
+            np.array(dataset_statistics["action"]["p99"])[:-1],
+            clip_min=-1, clip_max=1
+        )
+        # final dim is gripper, usually unnormalized
+        raw_action_t = np.concatenate([raw_action_except_gripper, norm_action_t[-1:]], axis=0)
+        # e.g. [dx, dy, dz, droll, dpitch, dyaw, dgrip]
 
-        # Loop over time steps for action evaluation
-        for t in range(num_steps_to_replay):
-            # Apply the dataset action a_t for 1 "time step"
-            #     (i.e. parse the action, convert to EEF delta, do IK, etc.)
-            print(f"batch {i+1}, step {t+1}")
-            norm_action_chunk = act[0, t].cpu().numpy()  # shape (4,7)
-            for substep in range(norm_action_chunk.shape[0]):
-                # e.g. shape (7,). If your dataset uses chunked actions, might be shape (horizon, 7)
-                # This should be the same as PiZero model inference output
-                norm_action_t = norm_action_chunk[substep]  # shape (7,)
+        # Take pose delta
+        dx, dy, dz = raw_action_t[0:3]
+        # your Euler -> delta_quat approach:
+        roll, pitch, yaw = raw_action_t[3:6]
 
-                # Denormalize
-                raw_action_except_gripper = adapter.denormalize_bound(
-                    norm_action_t[:-1],  # first 6 dims
-                    np.array(dataset_statistics["action"]["p01"])[:-1],
-                    np.array(dataset_statistics["action"]["p99"])[:-1],
-                    clip_min=-1, clip_max=1
-                )
-                # final dim is gripper, usually unnormalized
-                raw_action_t = np.concatenate([raw_action_except_gripper, norm_action_t[-1:]], axis=0)
-                # e.g. [dx, dy, dz, droll, dpitch, dyaw, dgrip]
-
-                # Take pose delta
-                dx, dy, dz = raw_action_t[0:3]
-                # your Euler -> delta_quat approach:
-                roll, pitch, yaw = raw_action_t[3:6]
-
-                for l in range(300):# 3Hz
-                    rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw)
-                    rosif.sleep_spin(0.001) 
+        rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw)
+        rosif.sleep_spin(0.3) # 3Hz
 
 if __name__ == "__main__":
     main()

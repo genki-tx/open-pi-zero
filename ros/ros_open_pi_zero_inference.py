@@ -156,7 +156,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         loginfo("Connected to google_fullbody_controller action server.")
 
         # Setup motion planner communication
-        self.moveit_pose_pub = rospy.Publisher("/moveit_server/target_pose", Pose, queue_size=1, latch=True)
+        self.moveit_pose_pub = rospy.Publisher("/moveit_server/planning_pose", Pose, queue_size=1, latch=True)
         loginfo("Waiting for /moveit_server/plan_arm service ...")
         rospy.wait_for_service("/moveit_server/plan_arm")
         self.moveit_plan_arm = rospy.ServiceProxy("/moveit_server/plan_arm", Trigger)
