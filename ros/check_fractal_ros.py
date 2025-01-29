@@ -31,10 +31,13 @@ class RosIf():
         self.joint_state_sub = rospy.Subscriber("/joint_states", JointState, self._joint_state_callback, queue_size=1)
         self.tf_listener = tf.TransformListener()
 
-        self.ros_control_client = actionlib.SimpleActionClient("/google_fullbody_trajectory_controller/follow_joint_trajectory",
-                                                   FollowJointTrajectoryAction)
         print("waiting for /google_fullbody_trajectory_controller/follow_joint_trajectory...")
-        self.ros_control_client.wait_for_server()
+        self.ros_control_fullbody = actionlib.SimpleActionClient("/google_fullbody_trajectory_controller/follow_joint_trajectory",
+                                                   FollowJointTrajectoryAction)
+        self.ros_control_gripper = actionlib.SimpleActionClient("/google_gripper_trajectory_controller/follow_joint_trajectory",
+                                                   FollowJointTrajectoryAction)
+        self.ros_control_fullbody.wait_for_server()
+        self.ros_control_gripper.wait_for_server()
 
         self.moveit_pose_pub = rospy.Publisher("/moveit_server/planning_pose", Pose, queue_size=1, latch=True)
         print("waiting for /moveit_server services...")
@@ -46,6 +49,8 @@ class RosIf():
         self.srv_switch_controller_trj = rospy.ServiceProxy("/moveit_server/switch_controller_trajectory", Trigger)
 
         self.servo_pub = rospy.Publisher("/servo_server/delta_twist_cmds", TwistStamped, queue_size=1)
+
+        self.gripper_angle_closed = 0.78
 
     def _joint_state_callback(self, msg: JointState):
         name_to_pos = {}
@@ -126,8 +131,8 @@ class RosIf():
         )
         (trans, rot) = self.tf_listener.lookupTransform(target_frame, source_frame, now)
         return (trans, rot)
-    
-    def send_joint_trajectory(self, dict_target_joint_positions):
+
+    def send_joint_trajectory(self, dict_target_joint_positions, controller='fullbody'):
         traj = JointTrajectory()
         traj.joint_names = dict_target_joint_positions.keys()
         pt = JointTrajectoryPoint()
@@ -137,8 +142,13 @@ class RosIf():
 
         goal = FollowJointTrajectoryGoal()
         goal.trajectory = traj
-        self.ros_control_client.send_goal(goal)
-    
+        if controller == 'fullbody':
+            self.ros_control_fullbody.send_goal(goal)
+        elif controller == 'gripper':
+            self.ros_control_gripper.send_goal(goal)
+        else:
+            rospy.logerr(f"Invalid controller type {controller}")
+
     # Suppose you have a policy action: dx, dy, dz, droll, dpitch, dyaw in local frame
     # and you want to apply it over dt=0.2 s at 10 Hz => 2 messages
     def apply_action_with_servo(self, dx, dy, dz, droll, dpitch, dyaw, time_scale=1.0):
@@ -154,7 +164,14 @@ class RosIf():
         msg.twist.angular.z = dyaw   * time_scale
 
         self.servo_pub.publish(msg)
-    
+
+    def control_gripper(self, gripper_closeness):
+        gripper_closeness = self.gripper_angle_closed * gripper_closeness
+        joint_dict = {}
+        joint_dict["joint_finger_right"] = gripper_closeness
+        joint_dict["joint_finger_left"] = gripper_closeness
+        self.send_joint_trajectory(joint_dict, "gripper")
+
     def switch_controllers(self, mode):
         try:
             if mode == 'trajectory':
@@ -250,7 +267,7 @@ def main():
     eef_quat_xyzw  = np.array(rot, dtype=np.float32)
     left_finger = rosif.latest_joints.get("joint_finger_left", 0.0)
     right_finger = rosif.latest_joints.get("joint_finger_right", 0.0)
-    gripper_max_range = 1.3
+    gripper_max_range = rosif.gripper_angle_closed
     gripper_closedness = ((left_finger + right_finger) / (2.0 * gripper_max_range))
     raw_proprio_ros = np.concatenate([eef_pos, eef_quat_xyzw, [gripper_closedness]], axis=0)  # shape (3+4+1=8,)
 
@@ -296,7 +313,6 @@ def main():
         for t in range(num_steps_to_replay):
             # Apply the dataset action a_t for 1 "time step"
             #     (i.e. parse the action, convert to EEF delta, do IK, etc.)
-            print(f"batch {i+1}, step {t+1}")
             norm_action_chunk = act[0, t].cpu().numpy()  # shape (4,7)
             for substep in range(norm_action_chunk.shape[0]):
                 # e.g. shape (7,). If your dataset uses chunked actions, might be shape (horizon, 7)
@@ -318,7 +334,10 @@ def main():
                 dx, dy, dz = raw_action_t[0:3]
                 # your Euler -> delta_quat approach:
                 roll, pitch, yaw = raw_action_t[3:6]
+                gripper_closedness = norm_action_t[-1]
 
+                print(f"batch {i+1}, step {t+1}, sub {substep}, grp={gripper_closedness}")
+                rosif.control_gripper(gripper_closedness)
                 for l in range(300):# 3Hz
                     rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw)
                     rosif.sleep_spin(0.001) 
