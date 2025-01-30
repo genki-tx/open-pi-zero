@@ -61,6 +61,7 @@ class RosIf():
         self.servo_pub = rospy.Publisher("/servo_server/delta_twist_cmds", TwistStamped, queue_size=1)
 
         self.gripper_angle_closed = 0.8
+        self.gripper_angle_opened = 0.4
 
         self.clear_observation()
         rospy.loginfo("RosIf initialization done")
@@ -203,13 +204,11 @@ class RosIf():
         self.servo_pub.publish(msg)
 
     def control_gripper(self, gripper_closeness):
-        # limitting
-        if gripper_closeness < 0:
-            gripper_closeness = 0
-        elif gripper_closeness > 0.5:
-            gripper_closeness = 1.0
+        if gripper_closeness > 0.5:
+            gripper_angle = self.gripper_angle_closed
+        else:
+            gripper_angle = self.gripper_angle_opened
         # calculate actual joint angle
-        gripper_angle = self.gripper_angle_closed * gripper_closeness
         joint_dict = {}
         joint_dict["joint_finger_right"] = gripper_angle
         joint_dict["joint_finger_left"] = gripper_angle
@@ -235,4 +234,7 @@ class RosIf():
         duration_msec = int(duration_sec * 1000.0)
         rate = rospy.Rate(1000)
         for _ in range(duration_msec):
-            rate.sleep()
+            try:
+                rate.sleep()
+            except rospy.exceptions.ROSTimeMovedBackwardsException:
+                pass # if Gazebo world was reset, this happens
