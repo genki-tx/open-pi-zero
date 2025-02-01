@@ -22,6 +22,7 @@ codecs.register_error("rosmsg", rosmsg_error_handler)
 import json
 import rospy
 import actionlib
+from std_msgs.msg import String
 from sensor_msgs.msg import JointState, Image
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
@@ -29,6 +30,82 @@ from geometry_msgs.msg import Pose, TwistStamped
 from std_srvs.srv import Trigger
 import tf
 import tf.transformations as tr
+
+class StickyGripperController:
+    def __init__(
+        self,
+        *,
+        sticky_threshold=0.5,
+        sticky_max_repeat=15,
+        close_joint_angle=0.9,
+        open_joint_angle=0.0,
+        zero_is_close=True,
+    ):
+        """
+        A sticky gripper controller that interprets an action in [0..1] each step, 
+        optionally '0=close, 1=open' or '0=open, 1=close' based on zero_is_close.
+
+        Args:
+            sticky_threshold (float): if the absolute difference from 0.5 is above this,
+                                      we latch the action for `sticky_max_repeat` steps
+            sticky_max_repeat (int): how many steps to keep ignoring new small changes
+            close_joint_angle (float): joint angle when the gripper is "closed" 
+            open_joint_angle (float): joint angle when the gripper is "open" 
+            zero_is_close (bool): If True, 0 => close & 1 => open. 
+                                  If False, 0 => open & 1 => close.
+        """
+        # Sticky config
+        self.sticky_threshold = sticky_threshold
+        self.sticky_max_repeat = sticky_max_repeat
+        self.sticky_action_on = False
+        self.sticky_repeat_left = 0
+        self.sticky_value = 0.0  # last latched value in [0..1]
+
+        # define your open vs close angles
+        #  typically close_joint_angle=some positive angle,
+        #  open_joint_angle=some smaller angle
+        self.close_joint_angle = close_joint_angle
+        self.open_joint_angle = open_joint_angle
+
+        # interpret how to map 0..1 to open/close
+        self.zero_is_close = zero_is_close
+        self.is_current_close = False
+        self.sticky_count = 0
+
+    def action_to_joint(self, raw_action):
+        if self.zero_is_close:
+            close_action = raw_action < 0.5
+        else:
+            close_action = raw_action > 0.5
+
+        if self.is_current_close:
+            if close_action:
+                self.sticky_count = self.sticky_max_repeat
+            else:
+                self.sticky_count -= 1
+            if self.sticky_count <= 0:
+                self.is_current_close = False
+                self.sticky_count = self.sticky_max_repeat
+        else: # current is open
+            if not close_action:
+                self.sticky_count = self.sticky_max_repeat
+            else:
+                self.sticky_count -= 2
+            if self.sticky_count <= 0:
+                self.is_current_close = True
+                self.sticky_count = self.sticky_max_repeat
+        return self.close_joint_angle if self.is_current_close else self.open_joint_angle
+
+    def joint_to_proprio(self, current_joint_angle):
+        # 1) clamp if needed
+        lo = min(self.close_joint_angle, self.open_joint_angle)
+        hi = max(self.close_joint_angle, self.open_joint_angle)
+        c_angle = max(lo, min(hi, current_joint_angle))
+
+        if self.zero_is_close:
+            return 0 if c_angle > 0.4 else 1
+        else:
+            return 1 if c_angle > 0.4 else 0
 
 class RosIf():
     def __init__(self, node_name="open_pi_zero_rosif_node"):
@@ -39,6 +116,7 @@ class RosIf():
 
         self.image_sub = rospy.Subscriber("/head_camera/image_raw", Image, self._image_callback, queue_size=1)
         self.joint_state_sub = rospy.Subscriber("/joint_states", JointState, self._joint_state_callback, queue_size=1)
+        self.text_instruction_pub = rospy.Subscriber("/text_instruction", String, self._text_instruction_callback, queue_size=1)
         self.tf_listener = tf.TransformListener()
 
         rospy.loginfo("waiting for /google_fullbody_trajectory_controller/follow_joint_trajectory...")
@@ -60,10 +138,10 @@ class RosIf():
 
         self.servo_pub = rospy.Publisher("/servo_server/delta_twist_cmds", TwistStamped, queue_size=1)
 
-        self.gripper_angle_closed = 0.8
-        self.gripper_angle_opened = 0.4
+        self.text_instruction = "Pick a coke-can"
 
         self.clear_observation()
+        self.gripper_controller = StickyGripperController()
         rospy.loginfo("RosIf initialization done")
 
     def is_observation_available(self):
@@ -82,6 +160,9 @@ class RosIf():
 
     def _image_callback(self, msg: Image):
         self.latest_image = msg
+
+    def _text_instruction_callback(self, msg: String):
+        self.text_instruction = msg
 
     def moveit_ik_solver(self, eef_pos, eef_quat_xyzw, finger_val):
         pose_goal = Pose()
@@ -125,7 +206,17 @@ class RosIf():
             "joint_forearm", "joint_wrist", "joint_gripper",
             "joint_finger_right", "joint_finger_left", "joint_head_pan", "joint_head_tilt"
         ]
-        initial_pose = [0.0, 0.1432, 0.1476, 1.22, 0.0, 0.93, -1.394, 0.4, 0.4, 0.0, 0.8]
+        initial_pose = [ \
+            -0.2639457174606611,
+            0.0831913360274175,
+            0.5017611504652179,
+            1.156859026208673,
+            0.028583671314766423,
+            1.592598203487462,
+            -1.080652960128774,
+            0, 0,
+            -0.00285961, 0.7851361]
+        [0.0, 0.1432, 0.1476, 1.22, 0.0, 0.93, -1.394, 0.4, 0.4, 0.0, 0.8]
         joint_dict = dict(zip(joint_names, initial_pose))
         self.send_joint_trajectory(joint_dict)
 
@@ -161,15 +252,6 @@ class RosIf():
         (trans, rot) = self.tf_listener.lookupTransform(target_frame, source_frame, now)
         return (trans, rot)
 
-    # return gripper's normalized state. 1 is opened, 0 is fully closed
-    def get_gripper_closedness(self):
-        left_finger = self.latest_joints.get("joint_finger_left", 0.0)
-        right_finger = self.latest_joints.get("joint_finger_right", 0.0)
-        gripper_max_range = self.gripper_angle_closed
-        closeness = ((left_finger + right_finger) / (2.0 * gripper_max_range))
-        openness = 1.0 - closeness
-        return 1.0 if openness > 0.5 else 0.0
-
     def send_joint_trajectory(self, dict_target_joint_positions, controller='fullbody'):
         traj = JointTrajectory()
         traj.joint_names = dict_target_joint_positions.keys()
@@ -203,11 +285,14 @@ class RosIf():
 
         self.servo_pub.publish(msg)
 
-    def control_gripper(self, gripper_closeness):
-        if gripper_closeness > 0.5:
-            gripper_angle = self.gripper_angle_closed
-        else:
-            gripper_angle = self.gripper_angle_opened
+    # return gripper's normalized state. 1 is opened, 0 is fully closed[TODO]
+    def get_gripper_proprio(self):
+        left_finger = self.latest_joints.get("joint_finger_left", 0.0)
+        #right_finger = self.latest_joints.get("joint_finger_right", 0.0)
+        return self.gripper_controller.joint_to_proprio(left_finger)
+
+    def control_gripper_by_action(self, gripper_action):
+        gripper_angle = self.gripper_controller.action_to_joint(gripper_action)
         # calculate actual joint angle
         joint_dict = {}
         joint_dict["joint_finger_right"] = gripper_angle

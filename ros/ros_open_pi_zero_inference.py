@@ -53,9 +53,10 @@ def load_checkpoint(model, checkpoint_path):
 class GoogleRobotOpenPiZeroInferenceNode:
     def __init__(self, node_name):
         self.rosif = RosIf(node_name)
+        self.rosif.text_instruction = "Pick a coke-can"
 
         # --- ROS Params ---
-        self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 50)
+        self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 3)
         self.checkpoint_path = rospy.get_param("~checkpoint_path", "/root/workspace/dataset/vla_log/2025-01-20_00-22_42_fractal_beta/checkpoint/step147900.pt")
         self.config_path = rospy.get_param("~config_path", "/root/workspace/open-pi-zero/config/eval/fractal_apple.yaml")
         self.gpu_id = rospy.get_param("~gpu_id", 0)
@@ -147,7 +148,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         images = torch.as_tensor(resized_image, dtype=torch.uint8).permute(2, 0, 1)[
             None
         ] # [1, 3, H, W]
-        instruction = "Pick a coke-can"
+        instruction = self.rosif.text_instruction
         model_inputs = self.adapter.processor(text=[instruction], images=images)
 
         # 3) Build normalized proprio (8D)
@@ -214,7 +215,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
 
         # Gather EEF pose from TF, and gripper state
         (eef_pos, eef_quat_xyzw) = self.rosif.lookup_transform("link_base", "link_gripper")
-        gripper_closedness = self.rosif.get_gripper_closedness()
+        gripper_closedness = self.rosif.get_gripper_proprio()
 
         # Prepare the model inputs
         model_inputs = self._prepare_model_inputs(eef_pos, eef_quat_xyzw, gripper_closedness)
@@ -255,16 +256,17 @@ class GoogleRobotOpenPiZeroInferenceNode:
             ],
             axis=1,
         )
-
+        count = 1
         for eef_delta in raw_actions[: self.cfg.act_steps]: # in fractal, usually act_steps = 2
             # Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
             # For simplicity, let's parse them
-            dx, dy, dz, roll, pitch, yaw, gripper_closedness = eef_delta
-            gripper_openness = 1.0 - gripper_closedness
-            self.rosif.control_gripper(gripper_openness)
-            for l in range(300):
-                self.rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw, 1.0)
-                self.rosif.sleep_spin(0.001) 
+            dx, dy, dz, roll, pitch, yaw, gripper_openness = eef_delta
+            self.rosif.control_gripper_by_action(gripper_openness) # 1 for close, 0 for open
+            print(f"[{count}] {gripper_openness}")
+            count += 1
+            for l in range(2):
+                self.rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw, 10.0)
+                self.rosif.sleep_spin(0.1) 
 
         self.rosif.clear_observation()
 
