@@ -53,10 +53,10 @@ def load_checkpoint(model, checkpoint_path):
 class GoogleRobotOpenPiZeroInferenceNode:
     def __init__(self, node_name):
         self.rosif = RosIf(node_name)
-        self.rosif.text_instruction = "Pick a coke-can"
+        self.rosif.text_instruction = "Pick a coke-can on the table and hold it up"
 
         # --- ROS Params ---
-        self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 3)
+        self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 3.0)
         self.checkpoint_path = rospy.get_param("~checkpoint_path", "/root/workspace/dataset/vla_log/2025-01-20_00-22_42_fractal_beta/checkpoint/step147900.pt")
         self.config_path = rospy.get_param("~config_path", "/root/workspace/open-pi-zero/config/eval/fractal_apple.yaml")
         self.gpu_id = rospy.get_param("~gpu_id", 0)
@@ -108,7 +108,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.timer_count = 0
 
         # Start a periodic timer to run inference + publish commands
-        rospy.Timer(rospy.Duration(1.0 / self.loop_rate_hz), self._control_loop)
+        rospy.Timer(rospy.Duration(0.001), self._control_loop)
 
     def _convert_image(self):
         """
@@ -206,7 +206,6 @@ class GoogleRobotOpenPiZeroInferenceNode:
           - Solve IK (or use a PD EEF controller) to get joint angles
           - Send the resulting joint command to the trajectory controller
         """
-
         if not self.rosif.is_observation_available():
             return
 
@@ -223,9 +222,9 @@ class GoogleRobotOpenPiZeroInferenceNode:
         # Forward pass, Run PiZero inference
         with torch.inference_mode():
             predicted_actions = self.model(**model_inputs)  # -> shape [B, horizon_steps, 7]
-        infer_dt = time.time() - start_t
 
         # Log inference time stats
+        infer_dt = time.time() - start_t
         self.inference_time_buffer.append(infer_dt)
         if self.timer_count % 10 == 0:
             t_arr = np.array(self.inference_time_buffer, dtype=np.float32)
@@ -256,18 +255,19 @@ class GoogleRobotOpenPiZeroInferenceNode:
             ],
             axis=1,
         )
-        count = 1
+
         for eef_delta in raw_actions[: self.cfg.act_steps]: # in fractal, usually act_steps = 2
             # Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
             # For simplicity, let's parse them
             dx, dy, dz, roll, pitch, yaw, gripper_openness = eef_delta
             self.rosif.control_gripper_by_action(gripper_openness) # 1 for close, 0 for open
-            print(f"[{count}] {gripper_openness}")
-            count += 1
-            for l in range(2):
-                self.rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw, 10.0)
-                self.rosif.sleep_spin(0.1) 
+            sleep_msec = 0.01
+            control_step = int(1.0 / self.loop_rate_hz / sleep_msec)
+            for l in range(control_step):
+                self.rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw, self.loop_rate_hz)#self.loop_rate_hz/self.cfg.act_steps)
+                self.rosif.sleep_spin(sleep_msec)
 
+        #self.rosif.apply_action_with_servo(0, 0, 0, 0, 0, 0)
         self.rosif.clear_observation()
 
     def spin(self):
