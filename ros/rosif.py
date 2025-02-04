@@ -73,6 +73,7 @@ class StickyGripperController:
         self.sticky_count = 0
 
     def action_to_joint(self, raw_action):
+        state_changed = False
         if self.zero_is_close:
             close_action = raw_action < 0.5
         else:
@@ -86,6 +87,7 @@ class StickyGripperController:
             if self.sticky_count <= 0:
                 self.is_current_close = False
                 self.sticky_count = self.sticky_max_repeat
+                state_changed = True
         else: # current is open
             if not close_action:
                 self.sticky_count = self.sticky_max_repeat
@@ -94,7 +96,10 @@ class StickyGripperController:
             if self.sticky_count <= 0:
                 self.is_current_close = True
                 self.sticky_count = self.sticky_max_repeat
-        return self.close_joint_angle if self.is_current_close else self.open_joint_angle
+                state_changed = True
+
+        angle = self.close_joint_angle if self.is_current_close else self.open_joint_angle
+        return (angle, state_changed)
 
     def joint_to_proprio(self, current_joint_angle):
         # 1) clamp if needed
@@ -292,12 +297,13 @@ class RosIf():
         return self.gripper_controller.joint_to_proprio(left_finger)
 
     def control_gripper_by_action(self, gripper_action):
-        gripper_angle = self.gripper_controller.action_to_joint(gripper_action)
+        (gripper_angle, state_changed) = self.gripper_controller.action_to_joint(gripper_action)
         # calculate actual joint angle
         joint_dict = {}
         joint_dict["joint_finger_right"] = gripper_angle
         joint_dict["joint_finger_left"] = gripper_angle
         self.send_joint_trajectory(joint_dict, "gripper")
+        return state_changed
 
     def switch_controllers(self, mode):
         try:

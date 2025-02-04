@@ -108,7 +108,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.timer_count = 0
 
         # Start a periodic timer to run inference + publish commands
-        rospy.Timer(rospy.Duration(0.001), self._control_loop)
+        rospy.Timer(rospy.Duration(0.3), self._control_loop)
 
     def _convert_image(self):
         """
@@ -260,14 +260,15 @@ class GoogleRobotOpenPiZeroInferenceNode:
             # Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
             # For simplicity, let's parse them
             dx, dy, dz, roll, pitch, yaw, gripper_openness = eef_delta
-            self.rosif.control_gripper_by_action(gripper_openness) # 1 for close, 0 for open
+            state_changed = self.rosif.control_gripper_by_action(gripper_openness) # 1 for close, 0 for open
+            if state_changed:
+                time.sleep(1)
             sleep_msec = 0.01
             control_step = int(1.0 / self.loop_rate_hz / sleep_msec)
             for l in range(control_step):
-                self.rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw, self.loop_rate_hz)#self.loop_rate_hz/self.cfg.act_steps)
+                self.rosif.apply_action_with_servo(dx, dy, dz, roll, pitch, yaw, self.loop_rate_hz)
                 self.rosif.sleep_spin(sleep_msec)
 
-        #self.rosif.apply_action_with_servo(0, 0, 0, 0, 0, 0)
         self.rosif.clear_observation()
 
     def spin(self):
