@@ -53,7 +53,7 @@ def load_checkpoint(model, checkpoint_path):
 class GoogleRobotOpenPiZeroInferenceNode:
     def __init__(self, node_name):
         self.rosif = RosIf(node_name)
-        self.rosif.text_instruction = "Pick a coke-can on the table and hold it up"
+        self.rosif.text_instruction = "pick coke can"
 
         # --- ROS Params ---
         self.loop_rate_hz = rospy.get_param("~loop_rate_hz", 3.0)
@@ -108,7 +108,7 @@ class GoogleRobotOpenPiZeroInferenceNode:
         self.timer_count = 0
 
         # Start a periodic timer to run inference + publish commands
-        rospy.Timer(rospy.Duration(0.3), self._control_loop)
+        rospy.Timer(rospy.Duration(1/self.loop_rate_hz), self._control_loop)
 
     def _convert_image(self):
         """
@@ -256,13 +256,13 @@ class GoogleRobotOpenPiZeroInferenceNode:
             axis=1,
         )
 
-        for eef_delta in raw_actions[: self.cfg.act_steps]: # in fractal, usually act_steps = 2
+        for eef_delta in raw_actions[: self.cfg.act_steps]:
             # Convert from [Δx, Δy, Δz, Δroll, Δpitch, Δyaw, Δgrip] into new EEF pose + new gripper value
             # For simplicity, let's parse them
             dx, dy, dz, roll, pitch, yaw, gripper_openness = eef_delta
             state_changed = self.rosif.control_gripper_by_action(gripper_openness) # 1 for close, 0 for open
             if state_changed:
-                time.sleep(1)
+                time.sleep(1.5)
             sleep_msec = 0.01
             control_step = int(1.0 / self.loop_rate_hz / sleep_msec)
             for l in range(control_step):
